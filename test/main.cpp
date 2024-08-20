@@ -72,8 +72,8 @@ void test()
 		prevPos = pos;
 	}
 
-	uint32_t width = 256;
-	uint32_t height = 256;
+	uint32_t width = 128;
+	uint32_t height = 128;
 	RasterizeOptions opts = { };
 	opts.offset = vec2(-200.0f, 700.0f);
 	opts.scale = vec2(1000.0f / float(width), -1000.0f / float(height));

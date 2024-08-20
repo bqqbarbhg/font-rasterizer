@@ -35,6 +35,8 @@ inline float vectorFromBits(int32_t v) {
 	return r;
 }
 
+inline float vectorSum(float v) { return v; }
+
 // -- SSE 2
 
 struct SseFloat4
@@ -142,6 +144,11 @@ inline void vectorStore(float *memory, SseFloat4 v) {
 inline SseInt4 vectorToBits(SseFloat4 v) { return _mm_castps_si128(v.v); }
 inline SseFloat4 vectorFromBits(SseInt4 v) { return _mm_castsi128_ps(v.v); }
 
+inline float vectorSum(SseFloat4 v) {
+	// TODO: Optimize
+	return v.x() + v.y() + v.z() + v.w();
+}
+
 // -- Math
 
 template <typename T>
@@ -202,6 +209,13 @@ template <typename T>
 inline T dot2(Vec2<T> a) {
 	return a.x*a.x + a.y*a.y;
 }
+
+template <typename T>
+inline Vec2<T> min(const Vec2<T> &a, const Vec2<T> &b) { return { min(a.x, b.x), min(a.y, b.y) }; }
+template <typename T>
+inline Vec2<T> max(const Vec2<T> &a, const Vec2<T> &b) { return { max(a.x, b.x), max(a.y, b.y) }; }
+template <typename T>
+inline Vec2<T> clamp(const Vec2<T> &a, const Vec2<T> &minV, const Vec2<T> &maxV) { return { clamp(a.x, minV.x, maxV.x), clamp(a.y, minV.y, maxV.y) }; }
 
 static const float Inf = (float)INFINITY;
 

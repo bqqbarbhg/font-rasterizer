@@ -3,8 +3,11 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <utility>
 
 // -- Implementation
+
+uint64_t bezierCalls;
 
 template <typename T, typename U>
 static bool intersectLine(T y, const Vec2<U> &A, const Vec2<U> &B, float* hits)
@@ -92,6 +95,8 @@ T distanceToLine(const Vec2<T> &pos, const Vec2<T> &A, const Vec2<T> &B)
 template <typename T>
 T distanceToBezier(const Vec2<T> &pos, const Vec2<T> &A, const Vec2<T> &B, const Vec2<T> &C)
 {
+	bezierCalls++;
+
 	Vec2<T> a = B - A;
 	Vec2<T> b = A - B*2.0f + C;
 	Vec2<T> c = a * 2.0f;
@@ -151,6 +156,7 @@ struct Rasterizer
 	uint32_t width;
 	uint32_t height;
 	float *distances;
+	FontBvh bvh;
 };
 
 template <typename T>
@@ -267,11 +273,173 @@ void calculateDistance(Rasterizer &r)
 	}
 }
 
+inline float project(const BvhLeaf &node, uint32_t axis) {
+	return ((float*)&node.bounds.boundsMin)[axis] + ((float*)&node.bounds.boundsMax)[axis];
+}
+
+void buildBvhNode(FontBvh &bvh, uint32_t dstIndex, uint32_t startIndex, uint32_t count)
+{
+	BvhLeaf *leafs = bvh.leafs.data() + startIndex;
+
+	Vec2f boundsMin = vec2(Inf, Inf);
+	Vec2f boundsMax = vec2(-Inf, -Inf);
+	for (uint32_t i = 0; i < count; i++) {
+		boundsMin = min(boundsMin, leafs[i].bounds.boundsMin);
+		boundsMax = max(boundsMax, leafs[i].bounds.boundsMax);
+	}
+
+	BvhNode &dst = bvh.nodes[dstIndex];
+	dst.bounds.boundsMin = boundsMin;
+	dst.bounds.boundsMax = boundsMax;
+	if (count <= 8) {
+		dst.childIndex = startIndex;
+		dst.childCount = count;
+		dst.childLeaf = true;
+		return;
+	}
+
+	uint32_t childIndex = (uint32_t)bvh.nodes.size();
+	dst.childIndex = childIndex;
+	dst.childCount = 2;
+	dst.childLeaf = false;
+
+	bvh.nodes.emplace_back();
+	bvh.nodes.emplace_back();
+
+	Vec2f boundsExtent = boundsMax - boundsMin;
+	uint32_t axis = boundsExtent.x > boundsExtent.y ? 0 : 1;
+
+	std::sort(leafs, leafs + count, [=](const BvhLeaf &a, const BvhLeaf &b) {
+		return project(a, axis) < project(b, axis);
+	});
+
+	uint32_t midpoint = count / 2;
+	buildBvhNode(bvh, childIndex + 0, startIndex, midpoint);
+	buildBvhNode(bvh, childIndex + 1, startIndex + midpoint, count - midpoint);
+}
+
+void buildBvh(FontBvh &bvh, const Font &font)
+{
+	uint32_t lineIndex = 0;
+	for (const Line &line : font.lines) {
+		bvh.leafs.push_back(BvhLeaf{
+			min(line.a, line.b),
+			max(line.a, line.b),
+			uint16_t(lineIndex),
+			BvhLeaf::Line,
+		});
+		lineIndex++;
+	}
+
+	uint32_t bezierIndex = 0;
+	for (const Bezier &bezier : font.beziers) {
+		bvh.leafs.push_back(BvhLeaf{
+			min(min(bezier.a, bezier.b), bezier.c),
+			max(max(bezier.a, bezier.b), bezier.c),
+			uint16_t(bezierIndex),
+			BvhLeaf::Bezier,
+		});
+		bezierIndex++;
+	}
+
+	bvh.nodes.emplace_back();
+	buildBvhNode(bvh, 0, 0, uint32_t(bvh.leafs.size()));
+}
+
+template <typename T>
+void calculateDistanceBvh(Rasterizer &r)
+{
+	constexpr uint32_t step = vectorWidth<T>();
+
+	struct StackEntry {
+		const BvhNode *node;
+		T dist2;
+	};
+
+	StackEntry stack[64];
+
+	for (uint32_t py = 0; py < r.height; py += step) {
+		float init[step];
+		for (uint32_t dy = 0; dy < step; dy++) {
+			init[dy] = float(py + dy);
+		}
+		T y = transformY(r, vectorLoad<T>(init));
+
+		T prevDist2 = Inf;
+
+		for (uint32_t px = 0; px < r.width; px++) {
+			float x = transformX(r, float(px));
+			Vec2<T> pos = vec2(T(x), y);
+
+			T dist2 = prevDist2;
+
+			uint32_t stackCount = 1;
+			stack[0].node = r.bvh.nodes.data();
+			stack[0].dist2 = 0.0f;
+			
+			while (stackCount > 0) {
+				StackEntry entry = stack[--stackCount];
+				if (!anyTrue(entry.dist2 < dist2)) continue;
+
+				const BvhNode &node = *entry.node;
+				if (node.childLeaf) {
+					for (uint32_t i = 0; i < node.childCount; i++) {
+						const BvhLeaf &leaf = r.bvh.leafs[node.childIndex + i];
+						T leafDist2 = leaf.bounds.distSq(pos);
+						if (!anyTrue(leafDist2 < dist2)) continue;
+
+						if (leaf.itemType == BvhLeaf::Line) {
+							const Line &line = r.font.lines[leaf.itemIndex];
+							T d = distanceToLine(pos, line.a.cast<T>(), line.b.cast<T>());
+							dist2 = min(dist2, d);
+						} else if (leaf.itemType == BvhLeaf::Bezier) {
+							const Bezier &bezier = r.font.beziers[leaf.itemIndex];
+							T d = distanceToBezier(pos, bezier.a.cast<T>(), bezier.b.cast<T>(), bezier.c.cast<T>());
+							dist2 = min(dist2, d);
+						}
+					}
+					continue;
+				}
+
+				const BvhNode *childA = &r.bvh.nodes[node.childIndex + 0];
+				const BvhNode *childB = &r.bvh.nodes[node.childIndex + 1];
+				T distA = childA->bounds.distSq(pos);
+				T distB = childB->bounds.distSq(pos);
+				if (vectorSum(distB) < vectorSum(distB)) {
+					std::swap(childA, childB);
+					std::swap(distA, distB);
+				}
+
+				stack[stackCount++] = { childA, distA };
+				stack[stackCount++] = { childB, distB };
+			}
+
+			T dist = sqrt(dist2);
+
+			// TODO: Why does this not work??
+			T nextDist = dist + T(step);
+			// prevDist2 = nextDist*nextDist;
+
+			vectorStore(init, dist);
+			for (uint32_t dy = 0; dy < step; dy++) {
+				uint32_t dstY = py + dy;
+				r.distances[dstY * r.width + px] *= init[dy];
+			}
+		}
+	}
+}
+
 template <typename T>
 void renderSdf(Rasterizer &r)
 {
+	bezierCalls = 0;
+
+	buildBvh(r.bvh, r.font);
 	setupWinding<T>(r);
-	calculateDistance<T>(r);
+	calculateDistanceBvh<T>(r);
+	// calculateDistance<T>(r);
+
+	printf(">>> %llu\n", bezierCalls);
 }
 
 void rasterizeFont(const Font &font, const RasterizeOptions &options, uint32_t width, uint32_t height, float *distances)
