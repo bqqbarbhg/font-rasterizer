@@ -37,6 +37,9 @@ inline float vectorFromBits(int32_t v) {
 
 inline float vectorSum(float v) { return v; }
 
+template <typename T>
+inline T vectorSequence() { return 0.0f; }
+
 // -- SSE 2
 
 struct SseFloat4
@@ -147,6 +150,11 @@ inline SseFloat4 vectorFromBits(SseInt4 v) { return _mm_castsi128_ps(v.v); }
 inline float vectorSum(SseFloat4 v) {
 	// TODO: Optimize
 	return v.x() + v.y() + v.z() + v.w();
+}
+
+template <>
+inline SseFloat4 vectorSequence<SseFloat4>() {
+	return SseFloat4(0.0f, 1.0f, 2.0f, 3.0f);
 }
 
 // -- Math
