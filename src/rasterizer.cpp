@@ -1533,7 +1533,7 @@ void vertexPass(Rasterizer &r, const Vec2f &point)
 	uint32_t px0 = (uint32_t)pxf;
 	uint32_t py0 = (uint32_t)pyf;
 
-	int32_t padding = r.padding * 0;
+	int32_t padding = r.padding;
 	for (int32_t dy = -padding; dy <= padding; dy++) {
 		uint32_t py = py0 + dy;
 		if (py >= r.height) continue;
@@ -1900,8 +1900,6 @@ void renderSdfNew(Rasterizer &r)
 		}
 	}
 
-	// Somehow broken
-#if 0
 	// -- Vertices
 	for (const Line &line : r.font.lines) {
 		vertexPass(r, line.a);
@@ -1909,14 +1907,12 @@ void renderSdfNew(Rasterizer &r)
 	}
 	for (const Bezier &bezier : r.font.beziers) {
 		vertexPass(r, bezier.a);
-		vertexPass(r, bezier.b);
 		vertexPass(r, bezier.c);
 	}
-#endif
 
 	expandWinding(r);
 
-	scanFill(r);
+	// scanFill(r);
 
 	finalizeDistance<T>(r);
 }

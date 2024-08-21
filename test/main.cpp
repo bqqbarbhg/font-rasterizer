@@ -19,14 +19,14 @@ unsigned char buffer[24<<20];
 void test()
 {
 	// fread(buffer, 1, sizeof(buffer), fopen("c:/windows/fonts/arialbd.ttf", "rb"));
-	fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Darumadrop_One\\DarumadropOne-Regular.ttf", "rb"));
-	// fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Noto_Sans\\NotoSansJP-Medium.ttf", "rb"));
+	// fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Darumadrop_One\\DarumadropOne-Regular.ttf", "rb"));
+	fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Noto_Sans\\NotoSansJP-Medium.ttf", "rb"));
 
 	stbtt_fontinfo font_info;
 	stbtt_InitFont(&font_info, buffer, 0);
 
-	// int codepoint = 0x6f22;
-	int codepoint = 'P';
+	int codepoint = 0x6f22;
+	// int codepoint = 'P';
 
 	stbtt_vertex *vertices;
 	int num_vertices = stbtt_GetCodepointShape(&font_info, codepoint,  &vertices);
