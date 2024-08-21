@@ -13,8 +13,15 @@
 inline bool anyTrue(bool mask) { return mask; }
 inline bool anyFalse(bool mask) { return !mask; }
 inline float maskSelect(bool mask, float a, float b) { return mask ? a : b; }
+
 inline float min(float a, float b) { return a < b ? a : b; }
 inline float max(float a, float b) { return a < b ? b : a; }
+
+template <typename T>
+inline T min(T a, T b) { return a < b ? a : b; }
+template <typename T>
+inline T max(T a, T b) { return a < b ? b : a; }
+
 
 template <typename T>
 constexpr uint32_t vectorWidth() { return 1; }

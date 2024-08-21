@@ -19,14 +19,14 @@ unsigned char buffer[24<<20];
 void test()
 {
 	// fread(buffer, 1, sizeof(buffer), fopen("c:/windows/fonts/arialbd.ttf", "rb"));
-	// fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Darumadrop_One\\DarumadropOne-Regular.ttf", "rb"));
-	fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Noto_Sans\\NotoSansJP-Medium.ttf", "rb"));
+	fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Darumadrop_One\\DarumadropOne-Regular.ttf", "rb"));
+	// fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Noto_Sans\\NotoSansJP-Medium.ttf", "rb"));
 
 	stbtt_fontinfo font_info;
 	stbtt_InitFont(&font_info, buffer, 0);
 
-	int codepoint = 0x6f22;
-	// int codepoint = 'P';
+	// int codepoint = 0x6f22;
+	int codepoint = 'P';
 
 	stbtt_vertex *vertices;
 	int num_vertices = stbtt_GetCodepointShape(&font_info, codepoint,  &vertices);
@@ -100,7 +100,7 @@ void test()
 
 	uint64_t minTime = UINT64_MAX;
 
-	uint32_t runs = 1;
+	uint32_t runs = 10000;
 
 	for (uint32_t i = 0; i < runs; i++) {
 		distances.clear();
@@ -118,9 +118,9 @@ void test()
 	cputime_end_init();
 	printf("Took %.2fms (%ux%u)\n", cputime_cpu_delta_to_sec(NULL, minTime) * 1e3, width, height);
 
-#if 0
+#if 1
 	for (float &d : distances) {
-		d = d / 100.0f + 0.5f;
+		d = d / 200.0f + 0.5f;
 	}
 #endif
 
