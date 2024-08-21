@@ -19,14 +19,14 @@ unsigned char buffer[24<<20];
 void test()
 {
 	// fread(buffer, 1, sizeof(buffer), fopen("c:/windows/fonts/arialbd.ttf", "rb"));
-	fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Darumadrop_One\\DarumadropOne-Regular.ttf", "rb"));
-	// fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Noto_Sans\\NotoSansJP-Medium.ttf", "rb"));
+	// fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Darumadrop_One\\DarumadropOne-Regular.ttf", "rb"));
+	fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Noto_Sans\\NotoSansJP-Medium.ttf", "rb"));
 
 	stbtt_fontinfo font_info;
 	stbtt_InitFont(&font_info, buffer, 0);
 
-	// int codepoint = 0x6f22;
-	int codepoint = 'P';
+	int codepoint = 0x6f22;
+	// int codepoint = 'P';
 
 	stbtt_vertex *vertices;
 	int num_vertices = stbtt_GetCodepointShape(&font_info, codepoint,  &vertices);
@@ -36,10 +36,16 @@ void test()
 	Font font;
 	bool verbose = false;
 
+	Vec2f boundsMin = vec2(Inf, Inf);
+	Vec2f boundsMax = vec2(-Inf, -Inf);
+
 	for (int i = 0; i < num_vertices; i++) {
 		stbtt_vertex v = vertices[i];
 		Vec2<int16_t> pos = vec2(v.x, v.y);
 		Vec2<int16_t> control = vec2(v.cx, v.cy);
+
+		boundsMin = min(boundsMin, pos.cast<float>());
+		boundsMax = max(boundsMax, pos.cast<float>());
 
 		switch (v.type) {
 		case STBTT_vmove:
@@ -76,11 +82,17 @@ void test()
 		prevPos = pos;
 	}
 
-	uint32_t width = 128;
-	uint32_t height = 128;
+	uint32_t width = 64;
+	uint32_t height = 0;
+	if (height == 0) height = width;
 	RasterizeOptions opts = { };
-	opts.offset = vec2(-100.0f, 700.0f);
-	opts.scale = vec2(800.0f / float(width), -800.0f / float(height));
+
+	Vec2f boundsExtent = boundsMax - boundsMin;
+	float boundsSize = max(boundsExtent.x, boundsExtent.y) * 1.2f;
+	Vec2f boundsMid = (boundsMin + boundsMax) * 0.5f;
+
+	opts.offset = vec2(boundsMid.x - boundsSize * 0.5f, boundsMid.y + boundsSize * 0.5f);
+	opts.scale = vec2(boundsSize / float(width), -boundsSize / float(height));
 
 	std::vector<float> distances;
 
@@ -88,7 +100,7 @@ void test()
 
 	uint64_t minTime = UINT64_MAX;
 
-	uint32_t runs = 100;
+	uint32_t runs = 1;
 
 	for (uint32_t i = 0; i < runs; i++) {
 		distances.clear();
@@ -106,7 +118,7 @@ void test()
 	cputime_end_init();
 	printf("Took %.2fms (%ux%u)\n", cputime_cpu_delta_to_sec(NULL, minTime) * 1e3, width, height);
 
-#if 1
+#if 0
 	for (float &d : distances) {
 		d = d / 100.0f + 0.5f;
 	}

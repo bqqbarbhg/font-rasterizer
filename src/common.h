@@ -40,6 +40,8 @@ inline float vectorSum(float v) { return v; }
 template <typename T>
 inline T vectorSequence() { return 0.0f; }
 
+inline uint32_t vectorBitmask(bool v) { return v ? 1 : 0; }
+
 // -- SSE 2
 
 struct SseFloat4
@@ -130,7 +132,8 @@ inline bool anyFalse(SseFloat4::Mask mask) {
 	return !_mm_test_all_ones(t);
 }
 inline SseFloat4 maskSelect(SseFloat4::Mask mask, SseFloat4 a, SseFloat4 b) {
-	return _mm_or_ps(_mm_and_ps(mask.v, a.v), _mm_andnot_ps(mask.v, b.v));
+	// return _mm_or_ps(_mm_and_ps(mask.v, a.v), _mm_andnot_ps(mask.v, b.v));
+	return _mm_blendv_ps(b.v, a.v, mask.v);
 }
 
 template <>
@@ -155,6 +158,10 @@ inline float vectorSum(SseFloat4 v) {
 template <>
 inline SseFloat4 vectorSequence<SseFloat4>() {
 	return SseFloat4(0.0f, 1.0f, 2.0f, 3.0f);
+}
+
+inline uint32_t vectorBitmask(SseFloat4::Mask v) {
+	return (uint32_t)_mm_movemask_ps(v.v);
 }
 
 // -- Math
