@@ -8,6 +8,7 @@
 // -- Implementation
 
 uint64_t bezierCalls;
+uint64_t bezierCallsNR;
 
 template <typename T, typename U>
 static bool intersectLine(T y, const Vec2<U> &A, const Vec2<U> &B, float* hits)
@@ -26,7 +27,7 @@ static bool intersectLine(T y, const Vec2<U> &A, const Vec2<U> &B, float* hits)
 }
 
 template <typename T, typename U>
-static bool intersectBezierX(T y, const Vec2<U> &A, const Vec2<U> &B, const Vec2<U> &C, float *hits)
+static bool intersectBezier(T y, const Vec2<U> &A, const Vec2<U> &B, const Vec2<U> &C, float *hits)
 {
 	T p0 = T(A.y) - y, p1 = T(B.y) - y, p2 = T(C.y) - y;
 	T a = p0 - p1 * 2.0f + p2;
@@ -76,21 +77,43 @@ static bool intersectBezierX(T y, const Vec2<U> &A, const Vec2<U> &B, const Vec2
 	return false;
 }
 
-template <typename T, typename U>
-static bool intersectBezierY(T x, const Vec2<U> &A, const Vec2<U> &B, const Vec2<U> &C, float *hits)
+template <typename T>
+struct BezierEx
 {
-	T p0 = T(A.x) - x, p1 = T(B.x) - x, p2 = T(C.x) - x;
-	T a = p0 - p1 * 2.0f + p2;
-	T b = (p1 - p0) * 2.0f;
-	T c = p0;
+	Vec2<T> a, b, c;
 
-	T ax = T(A.y - B.y * 2.0f + C.y);
-	T bx = T((B.y - A.y) * 2.0f);
-	T cx = T(A.y);
+	void inPlaceSwapXY() {
+		a = a.yx();
+		b = b.yx();
+		c = c.yx();
+	}
+};
+
+template <typename T, typename U>
+static BezierEx<T> setupBezierEx(const Vec2<U> &A, const Vec2<U> &B, const Vec2<U> &C)
+{
+	BezierEx<T> b;
+	b.a = (A - B * 2.0f + C).cast<T>();
+	b.b = ((B - A) * 2.0f).cast<T>();
+	b.c = A.cast<T>();
+	return b;
+}
+
+template <typename T>
+static inline bool intersectBezierEx(T y, const BezierEx<T> &bezier, float *hits, float *ts)
+{
+	T a = bezier.a.y;
+	T b = bezier.b.y;
+	T c = bezier.c.y - y;
+
+	T ax = bezier.a.x;
+	T bx = bezier.b.x;
+	T cx = bezier.c.x;
 
 	bool anyHit = false;
 	T miss = Inf;
 	T hit0 = miss, hit1 = miss;
+	T t0 = miss, t1 = miss;
 
 	auto valid = abs(a) > 0.0f;
 	if (anyTrue(valid)) {
@@ -101,8 +124,8 @@ static bool intersectBezierY(T x, const Vec2<U> &A, const Vec2<U> &B, const Vec2
 			T disc = sqrt(disc2);
 
 			T rcpA = T(-0.5f) / a;
-			T t0 = (b + disc) * rcpA;
-			T t1 = (b - disc) * rcpA;
+			t0 = (b + disc) * rcpA;
+			t1 = (b - disc) * rcpA;
 
 			auto h0 = exists & (t0 >= 0.0f) & (t0 <= 1.0f);
 			auto h1 = exists & (t1 >= 0.0f) & (t1 <= 1.0f);
@@ -113,15 +136,17 @@ static bool intersectBezierY(T x, const Vec2<U> &A, const Vec2<U> &B, const Vec2
 		}
 	}
 	if (anyFalse(valid)) {
-		T t = c / -b;
-		auto h = !valid & (t >= 0.0f) & (t <= 1.0f);
-		hit0 = maskSelect(h, (ax*t+bx)*t+cx, hit0);
+		t0 = c / -b;
+		auto h = !valid & (t0 >= 0.0f) & (t0 <= 1.0f);
+		hit0 = maskSelect(h, (ax*t0+bx)*t0+cx, hit0);
 		anyHit |= anyTrue(h);
 	}
 
 	if (anyHit) {
 		vectorStore(hits + 0, hit0);
 		vectorStore(hits + vectorWidth<T>(), hit1);
+		vectorStore(ts + 0, t0);
+		vectorStore(ts + vectorWidth<T>(), t1);
 		return true;
 	}
 	return false;
@@ -350,7 +375,7 @@ void setupWinding(Rasterizer &r)
 			}
 		}
 		for (const Bezier &bezier : r.font.beziers) {
-			if (intersectBezierX(y, bezier.a, bezier.b, bezier.c, hits)) {
+			if (intersectBezier(y, bezier.a, bezier.b, bezier.c, hits)) {
 				for (uint32_t i = 0; i < step; i++) {
 					hitX[i][countX[i]] = hits[i];
 					countX[i] += hits[i] < Inf ? 1 : 0;
@@ -640,6 +665,7 @@ void setupJobs(Rasterizer &r)
 
 	constexpr uint32_t step = vectorWidth<T>();
 	float hits[step * 2];
+	float ts[step * 2];
 
 	uint32_t token = 0;
 
@@ -660,9 +686,10 @@ void setupJobs(Rasterizer &r)
 
 		token++;
 
+		BezierEx<float> bex = setupBezierEx<float>(bezier.a, bezier.b, bezier.c);
 		for (uint32_t py = py0; py < py1; py++) {
 			float y = transformY(r, (float)py);
-			if (!intersectBezierX(y, bezier.a, bezier.b, bezier.c, hits)) continue;
+			if (!intersectBezierEx(y, bex, hits, ts)) continue;
 
 			for (uint32_t i = 0; i < 2; i++) {
 				if (hits[i] < Inf) {
@@ -683,9 +710,10 @@ void setupJobs(Rasterizer &r)
 			}
 		}
 
+		bex.inPlaceSwapXY();
 		for (uint32_t px = px0; px < px1; px++) {
 			float x = transformX(r, (float)px);
-			if (!intersectBezierY(x, bezier.a, bezier.b, bezier.c, hits)) continue;
+			if (!intersectBezierEx(x, bex, hits, ts)) continue;
 
 			for (uint32_t i = 0; i < 2; i++) {
 				if (hits[i] < Inf) {
@@ -775,10 +803,248 @@ void calculateDistanceJobs(Rasterizer &r)
 	}
 }
 
+#define STATS 0
+
+template <typename T>
+struct BezierNR
+{
+	Vec2<T> A, B, C;
+	Vec2<T> a, b;
+	T aa, ab, bb;
+};
+
+template <typename T>
+BezierNR<T> setupBezierNR(const Vec2<T> &A, const Vec2<T> &B, const Vec2<T> &C)
+{
+	BezierNR<T> bz;
+	bz.A = A;
+	bz.B = B;
+	bz.C = C;
+	bz.a = A - B*2.0f + C;
+	bz.b = (B - A) * 2.0f;
+	bz.aa = dot(bz.a, bz.a);
+	bz.ab = dot(bz.a, bz.b);
+	bz.bb = dot(bz.b, bz.b);
+	return bz;
+}
+
+template <typename T>
+T distanceToBezierNR(const Vec2<T> &pos, const Vec2<T> &A, const Vec2<T> &B, const Vec2<T> &C, T t)
+{
+	bezierCallsNR++;
+
+	// TODO: Precomputed
+	Vec2<T> a = A - B*2.0f + C;
+	Vec2<T> b = (B - A) * 2.0f;
+	Vec2<T> c = A - pos;
+
+	T aa = dot(a, a);
+	T ab = dot(a, b);
+	T bb = dot(b, b);
+	T ac = dot(a, c);
+	T bc = dot(b, c);
+
+	Vec2<T> wr = c + (b + a*t)*t;
+	T dr = dot2(wr);
+
+	T prevT = t;
+
+	{
+		T vy = bc + (bb+ac*2.0f)*t + (ab*3.0f)*t*t + aa*2.0f*t*t*t;
+		T dy = (bb + ac*2.0f) + (ab*6.0f)*t + (aa*6.0f)*t*t;
+		t = t - vy / dy;
+	}
+
+	{
+		T vy = bc + (bb+ac*2.0f)*t + (ab*3.0f)*t*t + aa*2.0f*t*t*t;
+		T dy = (bb + ac*2.0f) + (ab*6.0f)*t + (aa*6.0f)*t*t;
+		t = t - vy / dy;
+	}
+
+	// printf("%f -> %f\n", prevT, t);
+
+	if (abs(t - prevT) > 0.5f) {
+		return distanceToBezier(pos, A, B, C);
+	}
+	t = saturate(t);
+
+	// t = saturate(t - kx);
+	Vec2<T> w = c + (b + a*t)*t;
+	return min(dr, dot2(w));
+}
+
+template <typename T>
+__forceinline T distanceToBezierNR(const Vec2<T> &pos, const BezierNR<T> &bz, T t)
+{
+	bezierCallsNR++;
+
+	Vec2<T> c = bz.A - pos;
+	T aa = bz.aa;
+	T ab = bz.ab;
+	T bb = bz.bb;
+	T ac = dot(bz.a, c);
+	T bc = dot(bz.b, c);
+
+	T p = bb + ac * 2.0f;
+	T q = ab * 3.0f;
+	T r = aa * 2.0f;
+
+	Vec2<T> wr = c + (bz.b + bz.a*t)*t;
+	T dr = dot2(wr);
+
+	T prevT = t;
+
+	{
+		T t2 = t*t;
+		T t3 = t2*t;
+
+		T vy = bc + p*t + q*t2 + r*t3;
+		T dy = p + q*t*2.0f + r*3.0f*t2;
+		t = t - vy / dy;
+	}
+
+#if 1
+	{
+		T t2 = t*t;
+		T t3 = t2*t;
+
+		T vy = bc + p*t + q*t2 + r*t3;
+		T dy = p + q*t*2.0f + r*3.0f*t2;
+		t = t - vy / dy;
+	}
+#endif
+
+	// printf("%f -> %f\n", prevT, t);
+
+	if (abs(t - prevT) > 0.5f) {
+		return distanceToBezier(pos, bz.A, bz.B, bz.C);
+	}
+	t = saturate(t);
+
+	// t = saturate(t - kx);
+	Vec2<T> w = c + (bz.b + bz.a*t)*t;
+	return min(dr, dot2(w));
+}
+
+template <typename T>
+void calculateDistanceNR(Rasterizer &r)
+{
+	constexpr uint32_t step = vectorWidth<T>();
+	float hits[step * 2];
+	float ts[step * 2];
+
+	int32_t padding = 2;
+
+	uint32_t pixelCount = r.width * r.height;
+	for (uint32_t i = 0; i < pixelCount; i++) {
+		r.distances[i] = Inf;
+	}
+
+	float errorSum = 0.0f;
+	float errorMax = 0.0f;
+	float errorCount = 0.0f;
+
+	uint32_t bezierIndex = 0;
+	for (const Bezier &bezier : r.font.beziers) {
+		Vec2f boundsMin = min(min(bezier.a, bezier.b), bezier.c);
+		Vec2f boundsMax = max(max(bezier.a, bezier.b), bezier.c);
+
+		float boundX = (float)(r.width - 1);
+		float boundY = (float)(r.height - 1);
+
+		uint32_t px0 = (uint32_t)clamp(inverseTransformX(r, boundsMin.x), 0.0f, boundX);
+		uint32_t px1 = (uint32_t)clamp(inverseTransformX(r, boundsMax.x) + 1, 0.0f, boundX);
+		uint32_t py0 = (uint32_t)clamp(inverseTransformY(r, boundsMax.y), 0.0f, boundY);
+		uint32_t py1 = (uint32_t)clamp(inverseTransformY(r, boundsMin.y) + 1, 0.0f, boundY);
+
+		BezierEx<float> bex = setupBezierEx<float>(bezier.a, bezier.b, bezier.c);
+		BezierNR<float> bnr = setupBezierNR<float>(bezier.a, bezier.b, bezier.c);
+		for (uint32_t py = py0; py < py1; py++) {
+			float y = transformY(r, (float)py);
+			if (!intersectBezierEx(y, bex, hits, ts)) continue;
+
+			for (uint32_t i = 0; i < 2; i++) {
+				if (hits[i] < Inf) {
+					float x = hits[i];
+					int32_t pxb = (int32_t)clamp(inverseTransformX(r, x), 0.0f, boundX);
+
+					for (int32_t dx = -padding; dx <= padding; dx++) {
+						int32_t pxi = pxb + dx;
+						if (pxi < 0 || pxi >= (int32_t)r.width) continue;
+						uint32_t px = (uint32_t)pxi;
+
+						float x = transformX(r, (float)px);
+						Vec2<T> pos = vec2(x, y);
+						T d2 = distanceToBezierNR(pos, bnr, ts[i]);
+						// T d2 = distanceToBezierNR(pos, bezier.a, bezier.b, bezier.c, ts[i]);
+						bezierCalls--;
+#if STATS
+						T dref = distanceToBezier(pos, bezier.a, bezier.b, bezier.c);
+						float error = abs(sqrt(dref) - sqrt(d2)) / r.options.scale.x;
+						errorSum += error;
+						errorMax = max(errorMax, error);
+						errorCount += 1.0f;
+#endif
+						float &dr = r.distances[py * r.width + px];
+						dr = min(dr, d2);
+					}
+				}
+			}
+		}
+
+		bex.inPlaceSwapXY();
+		for (uint32_t px = px0; px < px1; px++) {
+			float x = transformX(r, (float)px);
+			if (!intersectBezierEx(x, bex, hits, ts)) continue;
+
+			for (uint32_t i = 0; i < 2; i++) {
+				if (hits[i] < Inf) {
+					float y = hits[i];
+					int32_t pyb = (int32_t)clamp(inverseTransformY(r, y), 0.0f, boundY);
+
+					for (int32_t dy = -padding; dy <= padding; dy++) {
+						int32_t pyi = pyb + dy;
+						if (pyi < 0 || pyi >= (int32_t)r.height) continue;
+						uint32_t py = (uint32_t)pyi;
+
+						float y = transformY(r, (float)py);
+						Vec2<T> pos = vec2(x, y);
+						T d2 = distanceToBezierNR(pos, bnr, ts[i]);
+						// T d2 = distanceToBezierNR(pos, bezier.a, bezier.b, bezier.c, ts[i]);
+#if STATS
+						bezierCalls--;
+						T dref = distanceToBezier(pos, bezier.a, bezier.b, bezier.c);
+						float error = abs(sqrt(dref) - sqrt(d2)) / r.options.scale.x;
+						errorSum += error;
+						errorMax = max(errorMax, error);
+						errorCount += 1.0f;
+#endif
+						float &dr = r.distances[py * r.width + px];
+						dr = min(dr, d2);
+					}
+				}
+			}
+		}
+
+		bezierIndex++;
+	}
+
+#if STATS
+	printf("error: %f (max %f)\n", errorSum / errorCount, errorMax);
+#endif
+
+	for (uint32_t i = 0; i < pixelCount; i += step) {
+		T t = vectorLoad<T>(r.distances + i);
+		t = sqrt(t);
+		vectorStore(r.distances + i, t);
+	}
+}
+
 template <typename T>
 void renderSdf(Rasterizer &r)
 {
 	bezierCalls = 0;
+	bezierCallsNR = 0;
 
 	// buildBvh(r.bvh, r.font);
 	// setupWinding<T>(r);
@@ -787,17 +1053,21 @@ void renderSdf(Rasterizer &r)
 	// calculateDistance<T>(r);
 	// calculateDistanceBvh<T>(r, pre);
 
-	setupJobs<T>(r);
-	calculateDistanceJobs<T>(r);
+	// setupJobs<T>(r);
+	// calculateDistanceJobs<T>(r);
+	calculateDistanceNR<T>(r);
 
 	//calculateDistancePre(r, pre);
 
-	// printf(">>> %llu (%.2f/px)\n", bezierCalls, (double)bezierCalls / double(r.width*r.height));
+#if STATS
+	printf(">>> Bezier %llu (%.2f/px)\n", bezierCalls, (double)bezierCalls / double(r.width*r.height));
+	printf(">>> Bezier NR %llu (%.2f/px)\n", bezierCallsNR, (double)bezierCallsNR / double(r.width*r.height));
+#endif
 }
 
 void rasterizeFont(const Font &font, const RasterizeOptions &options, uint32_t width, uint32_t height, float *distances)
 {
 	Rasterizer r = { font, options, width, height, distances };
-	// renderSdf<float>(r);
-	renderSdf<SseFloat4>(r);
+	renderSdf<float>(r);
+	// renderSdf<SseFloat4>(r);
 }

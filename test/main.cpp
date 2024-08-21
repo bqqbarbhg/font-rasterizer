@@ -26,7 +26,7 @@ void test()
 	stbtt_InitFont(&font_info, buffer, 0);
 
 	// int codepoint = 0x6f22;
-	int codepoint = '@';
+	int codepoint = 'P';
 
 	stbtt_vertex *vertices;
 	int num_vertices = stbtt_GetCodepointShape(&font_info, codepoint,  &vertices);
@@ -76,8 +76,8 @@ void test()
 		prevPos = pos;
 	}
 
-	uint32_t width = 64;
-	uint32_t height = 64;
+	uint32_t width = 128;
+	uint32_t height = 128;
 	RasterizeOptions opts = { };
 	opts.offset = vec2(-100.0f, 700.0f);
 	opts.scale = vec2(800.0f / float(width), -800.0f / float(height));

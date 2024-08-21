@@ -198,6 +198,8 @@ struct Vec2
 
 	template <typename U>
 	Vec2<U> cast() const { return Vec2<U> { U(x), U(y) }; }
+
+	Vec2 yx() const { return { y, x }; }
 };
 
 template <typename T>
