@@ -119,13 +119,8 @@ T distanceToBezier(const Vec2<T> &pos, const Vec2<T> &A, const Vec2<T> &B, const
 		h = sqrt(h);
 
 		Vec2<T> x = vec2(h - q, -h - q) * 0.5f;
-#if 1
-		T uvx = copysign(approxCbrt(abs(x.x)), x.x);
-		T uvy = copysign(approxCbrt(abs(x.y)), x.y);
-#else
-		T uvx = copysign(pow(abs(x.x), 1.0f/3.0f), x.x);
-		T uvy = copysign(pow(abs(x.y), 1.0f/3.0f), x.y);
-#endif
+		T uvx = approxCbrt(x.x);
+		T uvy = approxCbrt(x.y);
 		T t = uvx + uvy;
 
 		t = t - (t*(t*t+p*3.0f)+q)/(t*t*3.0f+p*3.0f);
@@ -149,6 +144,81 @@ T distanceToBezier(const Vec2<T> &pos, const Vec2<T> &A, const Vec2<T> &B, const
 	return maskSelect(mask, resTrue, resFalse);
 }
 
+template <typename T>
+struct PrecomputedBezier
+{
+	Vec2<T> a, b, c;
+	Vec2<T> dOffset;
+	T kk, kx;
+	Vec2<T> kyDot;
+	T kyBias;
+	Vec2<T> kzDot;
+};
+
+template <typename T>
+void precomputeBezier(PrecomputedBezier<T> &r, const Vec2<T> &A, const Vec2<T> &B, const Vec2<T> &C)
+{
+	r.dOffset = A.cast<T>();
+	r.a = (B - A).cast<T>();
+	r.b = (A - B*2.0f + C).cast<T>();
+	r.c = r.a * 2.0f;
+	r.kk = T(1.0f) / (T(1e-7f) + dot(r.b, r.b));
+	r.kx = r.kk * dot(r.a, r.b);
+	r.kyDot = r.b * r.kk * (1.0f / 3.0f);
+	r.kyBias = r.kk * dot(r.a, r.a) * (2.0f / 3.0f);
+	r.kzDot = r.a * r.kk;
+}
+
+// https://www.shadertoy.com/view/MlKcDD
+template <typename T>
+T distanceToBezier(const PrecomputedBezier<T> &bezier, const Vec2<T> &pos)
+{
+	bezierCalls++;
+
+	Vec2<T> d = bezier.dOffset - pos;
+
+	T kk = bezier.kk;
+	T kx = bezier.kx;
+	T ky = dot(bezier.kyDot, d) + bezier.kyBias;
+	T kz = dot(bezier.kzDot, d);
+
+	T p = ky - kx*kx;
+	T q = kx*(kx*kx*2.0f - ky*3.0f) + kz;
+	T p3 = p*p*p;
+	T q2 = q*q;
+	T h = q2 + p3*4.0f;
+
+	T resTrue = Inf, resFalse = Inf;
+	auto mask = h >= 0.0f;
+	if (anyTrue(mask)) {
+		h = sqrt(h);
+
+		Vec2<T> x = vec2(h - q, -h - q) * 0.5f;
+		T uvx = approxCbrt(x.x);
+		T uvy = approxCbrt(x.y);
+		T t = uvx + uvy;
+
+		// t = t - (t*(t*t+p*3.0f)+q)/(t*t*3.0f+p*3.0f);
+
+		t = saturate(t - kx);
+		Vec2<T> w = d + (bezier.c + bezier.b*t)*t;
+		resTrue = dot2(w);
+	}
+	if (anyFalse(mask)) {
+		T z = sqrt(max(-p, 0.0f));
+		T m = cosAcos3(q / (p*z*2.0f));
+		T n = sqrt(T(1.0f) - m*m);
+		n = n * sqrt(3.0f);
+		T tx = saturate((m+m)*z-kx);
+		T ty = saturate((-n-m)*z-kx);
+		Vec2<T> qx = d + (bezier.c + bezier.b*tx)*tx;
+		Vec2<T> qy = d + (bezier.c + bezier.b*ty)*ty;
+		resFalse = min(dot2(qx), dot2(qy));
+	}
+
+	return maskSelect(mask, resTrue, resFalse);
+}
+
 struct Rasterizer
 {
 	const Font &font;
@@ -157,6 +227,12 @@ struct Rasterizer
 	uint32_t height;
 	float *distances;
 	FontBvh bvh;
+};
+
+template <typename T>
+struct Precomputed
+{
+	std::vector<PrecomputedBezier<T>> beziers;
 };
 
 template <typename T>
@@ -273,6 +349,54 @@ void calculateDistance(Rasterizer &r)
 	}
 }
 
+template <typename T>
+void precompute(Precomputed<T> &pre, const Font &font)
+{
+	pre.beziers.resize(font.beziers.size());
+	for (size_t i = 0; i < font.beziers.size(); i++) {
+		const Bezier &bezier = font.beziers[i];
+		Vec2<T> a = bezier.a.cast<T>();
+		Vec2<T> b = bezier.b.cast<T>();
+		Vec2<T> c = bezier.c.cast<T>();
+		precomputeBezier(pre.beziers[i], a, b, c);
+	}
+}
+
+template <typename T>
+void calculateDistancePre(Rasterizer &r, Precomputed<T> &pre)
+{
+	constexpr uint32_t step = vectorWidth<T>();
+
+	for (uint32_t py = 0; py < r.height; py += step) {
+		float init[step];
+		for (uint32_t dy = 0; dy < step; dy++) {
+			init[dy] = float(py + dy);
+		}
+		T y = transformY(r, vectorLoad<T>(init));
+
+		for (uint32_t px = 0; px < r.width; px++) {
+			float x = transformX(r, float(px));
+			Vec2<T> pos = vec2(T(x), y);
+
+			T dist2 = Inf;
+			for (const Line &line : r.font.lines) {
+				T d = distanceToLine(pos, line.a.cast<T>(), line.b.cast<T>());
+				dist2 = min(dist2, d);
+			}
+			for (const PrecomputedBezier<T> &bezier : pre.beziers) {
+				T d = distanceToBezier(bezier, pos);
+				dist2 = min(dist2, d);
+			}
+
+			vectorStore(init, sqrt(dist2));
+			for (uint32_t dy = 0; dy < step; dy++) {
+				uint32_t dstY = py + dy;
+				r.distances[dstY * r.width + px] *= init[dy];
+			}
+		}
+	}
+}
+
 inline float project(const BvhLeaf &node, uint32_t axis) {
 	return ((float*)&node.bounds.boundsMin)[axis] + ((float*)&node.bounds.boundsMax)[axis];
 }
@@ -347,7 +471,7 @@ void buildBvh(FontBvh &bvh, const Font &font)
 }
 
 template <typename T>
-void calculateDistanceBvh(Rasterizer &r)
+void calculateDistanceBvh(Rasterizer &r, Precomputed<T> &pre)
 {
 	constexpr uint32_t step = vectorWidth<T>();
 
@@ -393,8 +517,13 @@ void calculateDistanceBvh(Rasterizer &r)
 							T d = distanceToLine(pos, line.a.cast<T>(), line.b.cast<T>());
 							dist2 = min(dist2, d);
 						} else if (leaf.itemType == BvhLeaf::Bezier) {
+#if 0
+							const PrecomputedBezier<T> &bezier = pre.beziers[leaf.itemIndex];
+							T d = distanceToBezier(bezier, pos);
+#else
 							const Bezier &bezier = r.font.beziers[leaf.itemIndex];
 							T d = distanceToBezier(pos, bezier.a.cast<T>(), bezier.b.cast<T>(), bezier.c.cast<T>());
+#endif
 							dist2 = min(dist2, d);
 						}
 					}
@@ -405,19 +534,23 @@ void calculateDistanceBvh(Rasterizer &r)
 				const BvhNode *childB = &r.bvh.nodes[node.childIndex + 1];
 				T distA = childA->bounds.distSq(pos);
 				T distB = childB->bounds.distSq(pos);
-				if (vectorSum(distB) < vectorSum(distB)) {
+				if (vectorSum(distB) > vectorSum(distA)) {
 					std::swap(childA, childB);
 					std::swap(distA, distB);
 				}
 
-				stack[stackCount++] = { childA, distA };
-				stack[stackCount++] = { childB, distB };
+				if (anyTrue(distA < dist2)) {
+					stack[stackCount++] = { childA, distA };
+					if (anyTrue(distB < dist2)) {
+						stack[stackCount++] = { childB, distB };
+					}
+				}
 			}
 
 			T dist = sqrt(dist2);
 
 			// TODO: Why does this not work??
-			T nextDist = dist + T(step);
+			T nextDist = dist + T(1.0f);
 			// prevDist2 = nextDist*nextDist;
 
 			vectorStore(init, dist);
@@ -436,15 +569,19 @@ void renderSdf(Rasterizer &r)
 
 	buildBvh(r.bvh, r.font);
 	setupWinding<T>(r);
-	calculateDistanceBvh<T>(r);
+	Precomputed<T> pre;
+	precompute(pre, r.font);
 	// calculateDistance<T>(r);
+	calculateDistanceBvh<T>(r, pre);
 
-	printf(">>> %llu\n", bezierCalls);
+	//calculateDistancePre(r, pre);
+
+	printf(">>> %llu (%.2f/px)\n", bezierCalls, (double)bezierCalls / double(r.width*r.height));
 }
 
 void rasterizeFont(const Font &font, const RasterizeOptions &options, uint32_t width, uint32_t height, float *distances)
 {
 	Rasterizer r = { font, options, width, height, distances };
-	// renderSdf<float>(r);
-	renderSdf<SseFloat4>(r);
+	renderSdf<float>(r);
+	// renderSdf<SseFloat4>(r);
 }

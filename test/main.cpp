@@ -18,14 +18,18 @@ unsigned char buffer[24<<20];
 
 void test()
 {
-	fread(buffer, 1, sizeof(buffer), fopen("c:/windows/fonts/arialbd.ttf", "rb"));
-	// fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Darumadrop_One\\DarumadropOne-Regular.ttf", "rb"));
+	// fread(buffer, 1, sizeof(buffer), fopen("c:/windows/fonts/arialbd.ttf", "rb"));
+	fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Darumadrop_One\\DarumadropOne-Regular.ttf", "rb"));
+	// fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Noto_Sans\\NotoSansJP-Medium.ttf", "rb"));
 
 	stbtt_fontinfo font_info;
 	stbtt_InitFont(&font_info, buffer, 0);
 
+	// int codepoint = 0x6f22;
+	int codepoint = 'P';
+
 	stbtt_vertex *vertices;
-	int num_vertices = stbtt_GetCodepointShape(&font_info, 'P',  &vertices);
+	int num_vertices = stbtt_GetCodepointShape(&font_info, codepoint,  &vertices);
 
 	Vec2<int16_t> contourStart, prevPos;
 
@@ -75,8 +79,8 @@ void test()
 	uint32_t width = 128;
 	uint32_t height = 128;
 	RasterizeOptions opts = { };
-	opts.offset = vec2(-200.0f, 700.0f);
-	opts.scale = vec2(1000.0f / float(width), -1000.0f / float(height));
+	opts.offset = vec2(-100.0f, 700.0f);
+	opts.scale = vec2(800.0f / float(width), -800.0f / float(height));
 
 	std::vector<float> distances;
 
@@ -84,7 +88,7 @@ void test()
 
 	uint64_t minTime = UINT64_MAX;
 
-	uint32_t runs = 5;
+	uint32_t runs = 1;
 
 	for (uint32_t i = 0; i < runs; i++) {
 		distances.clear();
@@ -100,7 +104,7 @@ void test()
 	}
 
 	cputime_end_init();
-	printf("Took %.2fms\n", cputime_cpu_delta_to_sec(NULL, minTime) * 1e3);
+	printf("Took %.2fms (%ux%u)\n", cputime_cpu_delta_to_sec(NULL, minTime) * 1e3, width, height);
 
 #if 1
 	for (float &d : distances) {
@@ -134,7 +138,7 @@ void test()
 			if (sdf) stbtt_FreeSDF(sdf, NULL);
 
 			uint64_t stbBegin = cputime_cpu_tick();
-			sdf = stbtt_GetCodepointSDF(&font_info, 0.25f, 'P', 20, 128, 1.0f, &w, &h, &x, &y);
+			sdf = stbtt_GetCodepointSDF(&font_info, 0.25f, codepoint, 20, 128, 1.0f, &w, &h, &x, &y);
 			uint64_t stbEnd = cputime_cpu_tick();
 			uint64_t duration = stbEnd - stbBegin;
 			if (stbMinTime > duration) {
@@ -143,12 +147,12 @@ void test()
 		}
 
 		printf("stbtt took %.2fms (%dx%d)\n", cputime_cpu_delta_to_sec(NULL, stbMinTime) * 1e3, w, h);
-		// stbi_write_png("sdf.png", w, h, 1, sdf, 0);
+		stbi_write_png("sdf.png", w, h, 1, sdf, 0);
 	}
 #endif
 
 	int refWidth, refHeight, refX, refY;
-	unsigned char *ref = stbtt_GetCodepointBitmap(&font_info, 1.0f, 1.0f, 'P', &refWidth, &refHeight, &refX, &refY);
+	unsigned char *ref = stbtt_GetCodepointBitmap(&font_info, 1.0f, 1.0f, codepoint, &refWidth, &refHeight, &refX, &refY);
 	stbi_write_png("ref.png", (int)refWidth, (int)refHeight, 1, ref, 0);
 
 }

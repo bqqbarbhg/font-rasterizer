@@ -151,17 +151,20 @@ inline float vectorSum(SseFloat4 v) {
 
 // -- Math
 
+// https://www.musicdsp.org/en/latest/Other/206-fast-cube-root-square-root-and-reciprocal-for-x86-sse-cpus.html
 template <typename T>
 inline T approxCbrt(T t) {
 	auto bits = vectorToBits(t);
+	auto sign = bits & 0x80000000;
 	bits = (bits & 0x7fffffff) - 0x3f800000; // unbias
 	bits = (bits >> 10) * 341; // logarithmic multiply by 1/3
 	bits = (bits + 0x3f800000) & 0x7fffffff; // rebias
+	bits = bits | sign;
 	T z = vectorFromBits(bits);
 
 	// Newton–Raphson steps
 	z = z - (z*z*z - t) / (z*z*3.0f);
-	z = z - (z*z*z - t) / (z*z*3.0f);
+	// z = z - (z*z*z - t) / (z*z*3.0f);
 
 	return z;
 }
