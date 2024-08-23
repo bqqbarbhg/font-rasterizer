@@ -34,7 +34,7 @@ struct LineEx
 	Vec2<T> scaledBa;
 	float rcpBay;
 	bool vertical;
-	bool winding;
+	uint32_t winding;
 };
 
 template <typename T>
@@ -47,7 +47,7 @@ LineEx<T> setupLineEx(const Line &line)
 	lex.scaledBa = (ba / dot2(ba)).cast<T>();
 	lex.rcpBay = 1.0f / ba.y;
 	lex.vertical = abs(ba.y) >= abs(ba.x);
-	lex.winding = ba.y >= 0.0f;
+	lex.winding = ba.y >= 0.0f ? ~0u : 0;
 	return lex;
 }
 
@@ -406,6 +406,83 @@ struct BezierJob
 	uint32_t py;
 };
 
+template <typename T>
+struct CombinedArray {
+	T *data;
+	size_t size;
+
+	const T &operator[](size_t ix) const {
+		assert(ix < size);
+		return data[ix];
+	}
+	T &operator[](size_t ix) {
+		assert(ix < size);
+		return data[ix];
+	}
+};
+
+template <int MaxArrays>
+struct CombinedAllocation {
+	void *data = nullptr;
+
+	struct ArrayReference
+	{
+		void **pointer;
+		size_t offset;
+	};
+
+	ArrayReference arrays[MaxArrays];
+	size_t arrayCount = 0;
+	size_t totalSize = 0;
+	bool doFree = false;
+
+	template <typename T>
+	void add(CombinedArray<T> &base, size_t size) {
+		size_t align = alignof(T);
+		totalSize += (totalSize + (align - 1)) & ~align;
+
+		ArrayReference &ref = arrays[arrayCount++];
+		ref.pointer = (void**)&base;
+		ref.offset = totalSize;
+		base.size = size;
+
+		totalSize += sizeof(T) * size;
+	}
+
+	void impUpdateOffsets() {
+		char *p = (char*)data;
+		for (size_t i = 0; i < arrayCount; i++) {
+			*arrays[i].pointer = p + arrays[i].offset;
+		}
+	}
+
+	void allocate() {
+		data = malloc(totalSize);
+		doFree = true;
+		impUpdateOffsets();
+	}
+
+	void setPointer(void *pointer, size_t size) {
+		assert(size >= totalSize);
+		data = pointer;
+		impUpdateOffsets();
+	}
+
+	void setPointerOrAllocate(void *pointer, size_t size) {
+		if (size >= totalSize) {
+			setPointer(pointer, size);
+		} else {
+			allocate();
+		}
+	}
+
+	~CombinedAllocation() {
+		if (doFree) {
+			free(data);
+		}
+	}
+};
+
 struct Rasterizer
 {
 	const Font &font;
@@ -418,9 +495,12 @@ struct Rasterizer
 	uint32_t safeHeight;
 	FontBvh bvh;
 
-	std::vector<float> distSqData[2];
-	std::vector<float> offsetXData[2];
-	std::vector<float> offsetYData[2];
+	CombinedArray<float> distSqData[2];
+	CombinedArray<float> offsetXData[2];
+	CombinedArray<float> offsetYData[2];
+	CombinedArray<float> rasterXs;
+	CombinedArray<float> rasterYs;
+	CombinedArray<int32_t> winding;
 
 	float *distSq;
 	float *offsetY;
@@ -430,12 +510,8 @@ struct Rasterizer
 	float *offsetYDst;
 	float *offsetXDst;
 
-	std::vector<int32_t> winding;
-
 	std::vector<uint32_t> scratch;
 	std::vector<BezierJob> bezierJobs;
-	std::vector<float> rasterXs;
-	std::vector<float> rasterYs;
 	int32_t padding;
 };
 
@@ -1109,7 +1185,7 @@ __forceinline T distanceToBezierExNR(const Vec2<T> &pos, const BezierNR<T> &bz, 
 
 	// t = saturate(t - kx);
 	Vec2<T> w = c + (bz.b + bz.a*t)*t;
-	closest = w;
+	closest = w + pos;
 	return min(dr, dot2(w));
 }
 
@@ -1246,9 +1322,9 @@ PixelBounds setupBounds(Rasterizer &r, const Vec2f &boundsMin, const Vec2f &boun
 	float maximumX = (float)(r.width - 1);
 	float maximumY = (float)(r.height - 1);
 	uint32_t px0 = (uint32_t)clamp(inverseTransformX(r, boundsMin.x), 0.0f, maximumX);
-	uint32_t px1 = (uint32_t)clamp(inverseTransformX(r, boundsMax.x) + 1, 0.0f, maximumX);
+	uint32_t px1 = (uint32_t)clamp(inverseTransformX(r, boundsMax.x) + 1.0f, 0.0f, maximumX);
 	uint32_t py0 = (uint32_t)clamp(inverseTransformY(r, boundsMax.y), 0.0f, maximumY);
-	uint32_t py1 = (uint32_t)clamp(inverseTransformY(r, boundsMin.y) + 1, 0.0f, maximumY);
+	uint32_t py1 = (uint32_t)clamp(inverseTransformY(r, boundsMin.y) + 1.0f, 0.0f, maximumY);
 	return { px0, px1, py0, py1 };
 }
 
@@ -1272,133 +1348,126 @@ __forceinline T distanceToLineEx(const Vec2<T> &pos, const LineEx<T> &lex, Vec2<
     Vec2<T> pa = pos - lex.a;
     T t = saturate(dot(lex.scaledBa, pa));
 	Vec2<T> p = lex.ba*t - pa;
-	closest = p;
+	closest = pos + p;
     return dot2(p);
 }
 
+#define VALIDATE 0
+
+__forceinline void storeClosestDistance(Rasterizer &r, uint32_t px, uint32_t py, float distSq, float x, float y, bool windingBit)
+{
+#if VALIDATE
+	{
+		Vec2f pixel = vec2(transformX(r, (float)px), transformY(r, (float)py));
+		Vec2f closest = vec2(x, y);
+		float distance = sqrt(dot2(closest - pixel));
+		float refDistance = sqrt(distSq);
+		assert(abs(distance - refDistance) <= 1.0f);
+	}
+#endif
+
+	uint32_t ix = py * r.safeWidth + px;
+	if (distSq > r.distSq[ix]) return;
+
+	int32_t winding = r.winding[ix];
+	if (winding < -1 || winding > 1) return;
+	winding = windingBit ? winding : -winding;
+	if (winding >= 1) return;
+
+	r.distSq[ix] = distSq;
+	r.offsetX[ix] = x;
+	r.offsetY[ix] = y;
+}
+
 template <typename T>
-__declspec(noinline) void linePassX(Rasterizer &r, const LineEx<T> &lex, uint32_t py0, T y, T x)
+__forceinline void storeClosestDistance(Rasterizer &r, uint32_t px0[4], uint32_t py0, uint32_t dx, const T& distSq, const Vec2<T> &closest, uint32_t windingBits)
 {
 	constexpr uint32_t step = vectorWidth<T>();
 
-	uint32_t width = r.width;
-	uint32_t safeWidth = r.safeWidth;
+	float distSqs[step];
+	float posX[step];
+	float posY[step];
+	vectorStore(distSqs, distSq);
+	vectorStore(posX, closest.x);
+	vectorStore(posY, closest.y);
 
-	int32_t windingDelta = lex.winding ? +1 : -1;
-
-	float pxs[step];
-	uint32_t px0[step];
-	T pxFloat = floor(clamp(inverseTransformX(r, x), T(0.0f), T((float)r.width)));
-	vectorStore(pxs, pxFloat);
-
-	// Accumulate winding
-	for (uint32_t dy = 0; dy < step; dy++) {
-		uint32_t py = py0 + dy;
-		uint32_t px = (uint32_t)pxs[dy];
-		px0[dy] = px;
-		if (px < width) {
-			verbosef("line %u,%u : %+d\n", px, py, windingDelta);
-			// TODO: This is not fresh...
-			r.winding[py * r.safeWidth + px + 1] += windingDelta;
-		}
-	}
-
-	if (lex.vertical) {
-		float *bufDistSq = r.distSq;
-		float *bufOffsetX = r.offsetX;
-		float *bufOffsetY = r.offsetY;
-
-		int32_t padding = r.padding;
-		for (int32_t dx = -padding; dx <= padding; dx++) {
-			T pxShifted = pxFloat + float(dx);
-
-			T x = transformX(r, pxShifted);
-			Vec2<T> pos = vec2(x, y);
-			Vec2<T> closest;
-			T distSq = distanceToLineEx(pos, lex, closest);
-
-			closest = closest + pos;
-
-			float distSqs[step];
-			float posX[step];
-			float posY[step];
-			vectorStore(distSqs, distSq);
-			vectorStore(posX, closest.x);
-			vectorStore(posY, closest.y);
-
-			for (uint32_t dy = 0; dy < step; dy++) {
-				uint32_t py = py0 + dy;
-				uint32_t px = px0[dy] + dx;
-				float d = distSqs[dy];
-
-				if (px < width) {
-					uint32_t ix = py * safeWidth + px;
-					if (d < r.distSq[ix]) {
-						bufDistSq[ix] = d;
-						bufOffsetX[ix] = posX[dy];
-						bufOffsetY[ix] = posY[dy];
-					}
-				}
-			}
+	for (uint32_t i = 0; i < step; i++) {
+		uint32_t py = py0 + i;
+		uint32_t px = px0[i] + dx;
+		if (px < r.width) {
+			storeClosestDistance(r, px, py, distSqs[i], posX[i], posY[i], (windingBits & (1 << i)) != 0);
 		}
 	}
 }
 
 template <typename T>
-__declspec(noinline) void linePassY(Rasterizer &r, const LineEx<T> &lex, uint32_t px0, T x, T y)
+__forceinline void storeClosestDistance(Rasterizer &r, uint32_t px0, uint32_t py0[4], uint32_t dy, const T& distSq, const Vec2<T> &closest, uint32_t windingBits)
 {
 	constexpr uint32_t step = vectorWidth<T>();
 
-	uint32_t height = r.height;
-	uint32_t safeWidth = r.safeWidth;
+	float distSqs[step];
+	float posX[step];
+	float posY[step];
+	vectorStore(distSqs, distSq);
+	vectorStore(posX, closest.x);
+	vectorStore(posY, closest.y);
 
-	float pys[step];
-	uint32_t py0[step];
-	T pyFloat = floor(clamp(inverseTransformY(r, y), T(0.0f), T((float)r.height)));
-	vectorStore(pys, pyFloat);
-
-	for (uint32_t dx = 0; dx < step; dx++) {
-		uint32_t px = (uint32_t)pys[dx];
-		py0[dx] = px;
+	for (uint32_t i = 0; i < step; i++) {
+		uint32_t px = px0 + i;
+		uint32_t py = py0[i] + dy;
+		if (py < r.height) {
+			storeClosestDistance(r, px, py, distSqs[i], posX[i], posY[i], (windingBits & (1 << i)) != 0);
+		}
 	}
+}
 
-	float *bufDistSq = r.distSq;
-	float *bufOffsetX = r.offsetX;
-	float *bufOffsetY = r.offsetY;
+constexpr float MaxPixelY = 1048576.0f;
+
+template <typename T>
+__declspec(noinline) void linePassX(Rasterizer &r, const LineEx<T> &lex, uint32_t py0, T y, T x, uint32_t windingBits)
+{
+	constexpr uint32_t step = vectorWidth<T>();
+
+	T pxRaw = inverseTransformX(r, x);
+	T pxFloat = rint(clamp(pxRaw, T(0.0f), T(MaxPixelY)));
+
+	uint32_t px0[step];
+	vectorStoreUint(px0, pxFloat);
+
+	int32_t padding = r.padding;
+	for (int32_t dx = -padding; dx <= padding; dx++) {
+		T pxShifted = pxFloat + float(dx);
+
+		uint32_t winding = vectorBitmask(pxShifted > pxRaw) ^ windingBits;
+
+		T x = transformX(r, pxShifted);
+		Vec2<T> closest, pos = vec2(x, y);
+		T distSq = distanceToLineEx(pos, lex, closest);
+		storeClosestDistance(r, px0, py0, dx, distSq, closest, winding);
+	}
+}
+
+template <typename T>
+__declspec(noinline) void linePassY(Rasterizer &r, const LineEx<T> &lex, uint32_t px0, T x, T y, uint32_t windingBits)
+{
+	constexpr uint32_t step = vectorWidth<T>();
+
+	T pyRaw = maskSelect(y < Inf, inverseTransformY(r, y), T(Inf));
+	T pyFloat = rint(clamp(pyRaw, T(0.0f), T(MaxPixelY)));
+
+	uint32_t py0[step];
+	vectorStoreUint(py0, pyFloat);
 
 	int32_t padding = r.padding;
 	for (int32_t dy = -padding; dy <= padding; dy++) {
 		T pyShifted = pyFloat + float(dy);
 
+		uint32_t winding = vectorBitmask(pyShifted > pyRaw) ^ windingBits;
+
 		T y = transformY(r, pyShifted);
-		Vec2<T> pos = vec2(y, x);
-		Vec2<T> closest;
+		Vec2<T> closest, pos = vec2(y, x);;
 		T distSq = distanceToLineEx(pos, lex, closest);
-
-		closest = closest + pos;
-
-		float distSqs[step];
-		float posX[step];
-		float posY[step];
-		vectorStore(distSqs, distSq);
-		// sic!
-		vectorStore(posX, closest.y);
-		vectorStore(posY, closest.x);
-
-		for (uint32_t dx = 0; dx < step; dx++) {
-			uint32_t px = px0 + dx;
-			uint32_t py = py0[dx] + dy;
-			float d = distSqs[dx];
-
-			if (py < height) {
-				uint32_t ix = py * safeWidth + px;
-				if (d < r.distSq[ix]) {
-					bufDistSq[ix] = d;
-					bufOffsetX[ix] = posX[dx];
-					bufOffsetY[ix] = posY[dx];
-				}
-			}
-		}
+		storeClosestDistance(r, px0, py0, dy, distSq, closest.yx(), winding);
 	}
 }
 
@@ -1407,133 +1476,78 @@ __declspec(noinline) void bezierPassX(Rasterizer &r, BezierNR<T> &bnr, uint32_t 
 {
 	constexpr uint32_t step = vectorWidth<T>();
 
-	uint32_t width = r.width;
-	uint32_t safeWidth = r.safeWidth;
+	T pxRaw = inverseTransformX(r, x);
+	T pxFloat = rint(clamp(pxRaw, T(0.0f), T(MaxPixelY)));
 
-	uint32_t windingBits = vectorBitmask(winding >= 0.0f);
-
-	float pxs[step];
 	uint32_t px0[step];
-	T pxFloat = floor(clamp(inverseTransformX(r, x), T(0.0f), T((float)r.width)));
-	vectorStore(pxs, pxFloat);
-
-	// Accumulate winding
-	for (uint32_t dy = 0; dy < step; dy++) {
-		uint32_t py = py0 + dy;
-		uint32_t px = (uint32_t)pxs[dy];
-		px0[dy] = px;
-		if (px < width) {
-			int32_t windingDelta = (windingBits & (1 << dy)) != 0 ? +1 : -1;
-			verbosef("bezier %u,%u: %+d\n", px, py, windingDelta);
-			// HACK HACK
-			r.winding[py * r.safeWidth + px + 1] += windingDelta;
-		}
-	}
-
-	float *bufDistSq = r.distSq;
-	float *bufOffsetX = r.offsetX;
-	float *bufOffsetY = r.offsetY;
+	vectorStoreUint(px0, pxFloat);
 
 	int32_t padding = r.padding;
 	for (int32_t dx = -padding; dx <= padding; dx++) {
 		T pxShifted = pxFloat + float(dx);
 
+		uint32_t windingBits = vectorBitmask((pxShifted > pxRaw) ^ (winding >= 0.0f));
+
 		T x = transformX(r, pxShifted);
-		Vec2<T> pos = vec2(x, y);
-		Vec2<T> closest;
+		Vec2<T> closest, pos = vec2(x, y);
 		T distSq = distanceToBezierExNR(pos, bnr, t, closest);
-
-		closest = closest + pos;
-
-		float distSqs[step];
-		float posX[step];
-		float posY[step];
-		vectorStore(distSqs, distSq);
-		vectorStore(posX, closest.x);
-		vectorStore(posY, closest.y);
-
-		for (uint32_t dy = 0; dy < step; dy++) {
-			uint32_t py = py0 + dy;
-			uint32_t px = px0[dy] + dx;
-			float d = distSqs[dy];
-
-			if (px < width) {
-				uint32_t ix = py * safeWidth + px;
-				if (d < r.distSq[ix]) {
-					bufDistSq[ix] = d;
-					bufOffsetX[ix] = posX[dy];
-					bufOffsetY[ix] = posY[dy];
-				}
-			}
-		}
+		storeClosestDistance(r, px0, py0, dx, distSq, closest, windingBits);
 	}
 }
 
 template <typename T>
-__declspec(noinline) void bezierPassY(Rasterizer &r, BezierNR<T> &bnr, uint32_t px0, T x, T y, T t)
+__declspec(noinline) void bezierPassY(Rasterizer &r, BezierNR<T> &bnr, uint32_t px0, T x, T y, T t, T winding)
 {
 	constexpr uint32_t step = vectorWidth<T>();
 
-	uint32_t height = r.height;
-	uint32_t safeWidth = r.safeWidth;
+	T pyRaw = maskSelect(y < Inf, inverseTransformY(r, y), T(Inf));
+	T pyFloat = floor(clamp(pyRaw, T(0.0f), T(MaxPixelY)));
 
-	float pys[step];
 	uint32_t py0[step];
-	T pyFloat = floor(clamp(inverseTransformY(r, y), T(0.0f), T((float)r.height)));
-	vectorStore(pys, pyFloat);
-
-	for (uint32_t dx = 0; dx < step; dx++) {
-		uint32_t px = (uint32_t)pys[dx];
-		py0[dx] = px;
-	}
-
-	float *bufDistSq = r.distSq;
-	float *bufOffsetX = r.offsetX;
-	float *bufOffsetY = r.offsetY;
+	vectorStoreUint(py0, pyFloat);
 
 	int32_t padding = r.padding;
 	for (int32_t dy = -padding; dy <= padding; dy++) {
 		T pyShifted = pyFloat + float(dy);
 
+		uint32_t windingBits = vectorBitmask((pyShifted > pyRaw) ^ (winding >= 0.0f));
+
 		T y = transformY(r, pyShifted);
-		Vec2<T> pos = vec2(x, y);
-		Vec2<T> closest;
+		Vec2<T> closest, pos = vec2(x, y);
 		T distSq = distanceToBezierExNR(pos, bnr, t, closest);
-
-		closest = closest + pos;
-
-		float distSqs[step];
-		float posX[step];
-		float posY[step];
-		vectorStore(distSqs, distSq);
-		vectorStore(posX, closest.x);
-		vectorStore(posY, closest.y);
-
-		for (uint32_t dx = 0; dx < step; dx++) {
-			uint32_t px = px0 + dx;
-			uint32_t py = py0[dx] + dy;
-			float d = distSqs[dx];
-
-			if (py < height) {
-				uint32_t ix = py * safeWidth + px;
-				if (d < r.distSq[ix]) {
-					bufDistSq[ix] = d;
-					bufOffsetX[ix] = posX[dx];
-					bufOffsetY[ix] = posY[dx];
-				}
-			}
-		}
+		storeClosestDistance(r, px0, py0, dy, distSq, closest, windingBits);
+		storeClosestDistance(r, px0, py0, dy, distSq, closest, windingBits);
 	}
 }
 
 void vertexPass(Rasterizer &r, const Vec2f &point)
 {
-	float pxf = max(floor(inverseTransformX(r, point.x)), 0.0f);
-	float pyf = max(floor(inverseTransformY(r, point.y)), 0.0f);
+	float pxf = max(rint(inverseTransformX(r, point.x)), 0.0f);
+	float pyf = max(rint(inverseTransformY(r, point.y)), 0.0f);
 	uint32_t px0 = (uint32_t)pxf;
 	uint32_t py0 = (uint32_t)pyf;
-
 	int32_t padding = r.padding;
+
+	// TODO: SIMD this!
+
+	// Check if the vertex is in a controversial area
+	bool controversial = false;
+	for (int32_t dy = -padding; dy <= padding; dy++) {
+		uint32_t py = py0 + dy;
+		if (py >= r.height) continue;
+
+		for (int32_t dx = -padding; dx <= padding; dx++) {
+			uint32_t px = px0 + dx;
+			if (px >= r.width) continue;
+
+			uint32_t ix = py * r.safeWidth + px;
+			uint32_t winding = r.winding[ix];
+			if (winding < 1 || winding > 1) {
+				controversial = true;
+			}
+		}
+	}
+
 	for (int32_t dy = -padding; dy <= padding; dy++) {
 		uint32_t py = py0 + dy;
 		if (py >= r.height) continue;
@@ -1544,9 +1558,13 @@ void vertexPass(Rasterizer &r, const Vec2f &point)
 			if (px >= r.width) continue;
 			float refX = r.rasterXs[px];
 
+			uint32_t ix = py * r.safeWidth + px;
+
+			uint32_t winding = r.winding[ix];
+			if (controversial && winding != 0) continue;
+
 			Vec2f pf = vec2(refX, refY);
 			float d = dot2(pf - point);
-			uint32_t ix = py * r.safeWidth + px;
 
 			if (d < r.distSq[ix]) {
 				r.distSq[ix] = d;
@@ -1557,89 +1575,66 @@ void vertexPass(Rasterizer &r, const Vec2f &point)
 	}
 }
 
-void expandWinding(Rasterizer &r)
+__declspec(noinline) void expandWinding(Rasterizer &r)
 {
 	uint32_t width = r.width;
 
-	for (uint32_t py = 0; py < r.height; py++) {
-		int32_t *windings = r.winding.data() + py * r.safeWidth;
-		float *dists = r.distances + py * r.width;
-
-		int32_t winding = 0;
-		for (uint32_t px = 0; px < width; px++) {
-			winding += windings[px];
-			windings[px] = winding;
-
-			dists[px] = winding != 0 ? -1.0f : 1.0f;
-		}
-	}
-}
-
 #if 0
-template <typename T>
-void jumpFloodFill(Rasterizer &r, int32_t radius)
-{
-	uint32_t step = vectorWidth<T>();
+	for (uint32_t py = 0; py < r.height; py += 4) {
+		int32_t *p0 = r.winding.data + (py + 0) * r.safeWidth;
+		int32_t *p1 = r.winding.data + (py + 1) * r.safeWidth;
+		int32_t *p2 = r.winding.data + (py + 2) * r.safeWidth;
+		int32_t *p3 = r.winding.data + (py + 3) * r.safeWidth;
 
-	int32_t height = r.height;
-	int32_t width = r.width;
-	int32_t safeWidth = int32_t(r.safeWidth);
+		int32_t w0 = 0;
+		int32_t w1 = 0;
+		int32_t w2 = 0;
+		int32_t w3 = 0;
 
-	const float *srcD = r.distSq;
-	const float *srcX = r.offsetX;
-	const float *srcY = r.offsetY;
-
-	float *dstD = r.distSqDst;
-	float *dstX = r.offsetXDst;
-	float *dstY = r.offsetYDst;
-
-	for (int32_t py0 = 0; py0 < height; py0++) {
-		T selfY = T(float(py0));
-		selfY = transformY(r, selfY);
-
-		for (int32_t px0 = 0; px0 < width; px0 += step) {
-			T selfX = T(float(px0)) + vectorSequence<T>();
-			selfX = transformX(r, selfX);
-
-			int32_t ix0 = py0 * safeWidth + px0;
-			T d0 = vectorLoad<T>(srcD + ix0);
-			T x0 = vectorLoad<T>(srcX + ix0);
-			T y0 = vectorLoad<T>(srcY + ix0);
-
-			for (int32_t dy = -radius; dy <= radius; dy += radius) {
-				int32_t py1 = clamp(py0 + dy, -int32_t(step), height);
-
-				for (int32_t dx = -radius; dx <= radius; dx += radius) {
-					int32_t px1 = clamp(px0 + dx, -int32_t(step), width);
-
-					if (dx == 0 && dy == 0) continue;
-
-					int32_t ix1 = py1 * safeWidth + px0;
-					T x1 = vectorLoad<T>(srcX + ix1);
-					T y1 = vectorLoad<T>(srcY + ix1);
-					
-					T sdx = x1 - selfX;
-					T sdy = y1 - selfY;
-					T d1 = sdx*sdx + sdy*sdy;
-
-					auto less = d1 < d0;
-					d0 = maskSelect(less, d1, d0);
-					x0 = maskSelect(less, x1, x0);
-					y0 = maskSelect(less, y1, y0);
-				}
-			}
-
-			vectorStore(dstD + ix0, d0);
-			vectorStore(dstX + ix0, x0);
-			vectorStore(dstY + ix0, y0);
+		for (uint32_t px = 0; px < width; px++) {
+			w0 += p0[px]; p0[px] = w0;
+			w1 += p1[px]; p1[px] = w1;
+			w2 += p2[px]; p2[px] = w2;
+			w3 += p3[px]; p3[px] = w3;
 		}
 	}
+#else
+	constexpr int ma = (int)0x03020100;
+	constexpr int mb = (int)0x07060504;
+	constexpr int mc = (int)0x0b0a0908;
 
-	std::swap(r.distSqDst, r.distSq);
-	std::swap(r.offsetXDst, r.offsetX);
-	std::swap(r.offsetYDst, r.offsetY);
-}
+	const __m128i mask_0aba = _mm_setr_epi32(-1, ma, mb, ma);
+	const __m128i mask_00ac = _mm_setr_epi32(-1,-1, ma, mc);
+
+	for (uint32_t py = 0; py < r.height; py += 2) {
+		int32_t *ptr0 = r.winding.data + (py + 0) * r.safeWidth;
+		int32_t *ptr1 = r.winding.data + (py + 1) * r.safeWidth;
+
+		__m128i prefix0 = _mm_setzero_si128();
+		__m128i prefix1 = _mm_setzero_si128();
+		for (uint32_t px = 0; px < width; px += 4) {
+			__m128i v0 = _mm_loadu_si128((const __m128i*)ptr0);
+			__m128i v1 = _mm_loadu_si128((const __m128i*)ptr1);
+
+			v0 = _mm_add_epi32(v0, _mm_shuffle_epi8(v0, mask_0aba));
+			v0 = _mm_add_epi32(v0, _mm_shuffle_epi8(v0, mask_00ac));
+			v0 = _mm_add_epi32(v0, prefix0);
+			prefix0 = _mm_shuffle_epi32(v0, _MM_SHUFFLE(3,3,3,3));
+
+			v1 = _mm_add_epi32(v1, _mm_shuffle_epi8(v1, mask_0aba));
+			v1 = _mm_add_epi32(v1, _mm_shuffle_epi8(v1, mask_00ac));
+			v1 = _mm_add_epi32(v1, prefix1);
+			prefix1 = _mm_shuffle_epi32(v1, _MM_SHUFFLE(3,3,3,3));
+
+			_mm_storeu_si128((__m128i*)ptr0, v0);
+			_mm_storeu_si128((__m128i*)ptr1, v1);
+
+			ptr0 += 4;
+			ptr1 += 4;
+		}
+	}
 #endif
+}
 
 void scanFill(Rasterizer &r)
 {
@@ -1669,7 +1664,7 @@ void scanFill(Rasterizer &r)
 				float nbY = srcY[nb];
 				float dx = nbX - selfX;
 				float dy = nbY - selfY;
-				float nbD = dx*dx + dy*dy;
+				float nbD = max(srcD[nb], dx*dx + dy*dy);
 				if (nbD < selfD) {
 					selfD = nbD;
 					offX = nbX;
@@ -1684,7 +1679,7 @@ void scanFill(Rasterizer &r)
 				float nbY = srcY[nb];
 				float dx = nbX - selfX;
 				float dy = nbY - selfY;
-				float nbD = dx*dx + dy*dy;
+				float nbD = max(srcD[nb], dx*dx + dy*dy);
 				if (nbD < selfD) {
 					selfD = nbD;
 					offX = nbX;
@@ -1719,7 +1714,7 @@ void scanFill(Rasterizer &r)
 				float nbY = srcY[nb];
 				float dx = nbX - selfX;
 				float dy = nbY - selfY;
-				float nbD = dx*dx + dy*dy;
+				float nbD = max(srcD[nb], dx*dx + dy*dy);
 				if (nbD < selfD) {
 					selfD = nbD;
 					offX = nbX;
@@ -1734,7 +1729,7 @@ void scanFill(Rasterizer &r)
 				float nbY = srcY[nb];
 				float dx = nbX - selfX;
 				float dy = nbY - selfY;
-				float nbD = dx*dx + dy*dy;
+				float nbD = max(srcD[nb], dx*dx + dy*dy);
 				if (nbD < selfD) {
 					selfD = nbD;
 					offX = nbX;
@@ -1752,6 +1747,93 @@ void scanFill(Rasterizer &r)
 	}
 }
 
+void scanFillConservative(Rasterizer &r)
+{
+	int32_t height = r.height;
+	int32_t width = r.width;
+	int32_t safeWidth = int32_t(r.safeWidth);
+
+	float *srcD = r.distSq;
+	float *srcX = r.offsetX;
+	float *srcY = r.offsetY;
+
+	float pixelScale = r.options.scale.x;
+
+	for (int32_t py = 0; py < height; py++) {
+		for (int32_t px = 0; px < width; px++) {
+			int32_t ix = py * safeWidth + px;
+
+			float selfX = r.rasterXs[px];
+			float selfY = r.rasterYs[py];
+
+			float selfD = srcD[ix];
+			bool changed = false;
+
+			int32_t nb = ix - 1;
+			if (srcD[nb] < selfD) {
+				float nbD = sqrt(srcD[nb]) + pixelScale;
+				nbD *= nbD;
+				if (nbD < selfD) {
+					selfD = nbD;
+					changed = true;
+				}
+			}
+
+			nb = ix - safeWidth;
+			if (srcD[nb] < selfD) {
+				float nbD = sqrt(srcD[nb]) + pixelScale * sqrt(2.0f);
+				nbD *= nbD;
+				if (nbD < selfD) {
+					selfD = nbD;
+					changed = true;
+				}
+			}
+
+			if (changed) {
+				srcD[ix] = selfD;
+			}
+		}
+	}
+
+	for (int32_t py = height - 1; py >= 0; py--) {
+		for (int32_t px = width - 1; px >= 0; px--) {
+			int32_t ix = py * safeWidth + px;
+
+			float selfX = r.rasterXs[px];
+			float selfY = r.rasterYs[py];
+
+			float offX = srcX[ix];
+			float offY = srcY[ix];
+			float selfD = srcD[ix];
+			bool changed = false;
+
+			int32_t nb = ix + 1;
+			if (srcD[nb] < selfD) {
+				float nbD = sqrt(srcD[nb]) + pixelScale;
+				nbD *= nbD;
+				if (nbD < selfD) {
+					selfD = nbD;
+					changed = true;
+				}
+			}
+
+			nb = ix + safeWidth;
+			if (srcD[nb] < selfD) {
+				float nbD = sqrt(srcD[nb]) + pixelScale * sqrt(2.0f);
+				nbD *= nbD;
+				if (nbD < selfD) {
+					selfD = nbD;
+					changed = true;
+				}
+			}
+
+			if (changed) {
+				srcD[ix] = selfD;
+			}
+		}
+	}
+}
+
 template <typename T>
 void finalizeDistance(Rasterizer &r)
 {
@@ -1762,18 +1844,168 @@ void finalizeDistance(Rasterizer &r)
 	for (uint32_t py = 0; py < r.height; py++) {
 		float *dists = r.distances + py * r.width;
 		float *distSq = r.distSq + py * r.safeWidth;
+		int32_t *windings = r.winding.data + py * r.safeWidth;
 
 		int32_t winding = 0;
 		uint32_t px = 0;
 		for (; px + step <= width; px += step) {
 			T d = vectorLoad<T>(dists + px);
 			T dsq = vectorLoad<T>(distSq + px);
-			T result = d * sqrt(dsq);
+			T result = flipSignIfNonZero(d * sqrt(dsq), windings + px);
+
 			vectorStore(dists + px, result);
 		}
 		for (; px < width; px++) {
-			dists[px] *= sqrt(distSq[px]);
+			float d = dists[px];
+			float dsq = distSq[px];
+			d = d * sqrt(dsq);
+			d = windings[px] != 0 ? -d : d;
+			dists[px] = d;
 		}
+	}
+}
+
+template <typename T>
+__forceinline void addWinding(Rasterizer &r, uint32_t py0, T x, uint32_t windingBits)
+{
+	constexpr uint32_t step = vectorWidth<T>();
+
+	float pxs[step];
+	T hitPx = clamp(inverseTransformX(r, x) + 1.0f, T(0.0f), T((float)r.width));
+	vectorStore(pxs, hitPx);
+
+	// Accumulate winding
+	for (uint32_t i = 0; i < step; i++) {
+		uint32_t py = py0 + i;
+		uint32_t px = (uint32_t)pxs[i];
+		if (px < r.width) {
+			int32_t windingDelta = (windingBits & (1 << i)) != 0 ? +1 : -1;
+			r.winding[py * r.safeWidth + px] += windingDelta;
+		}
+	}
+}
+
+template <typename T>
+__declspec(noinline) void computeContourWinding(Rasterizer &r)
+{
+	constexpr uint32_t step = vectorWidth<T>();
+
+	float *rasterXs = r.rasterXs.data;
+	float *rasterYs = r.rasterYs.data;
+
+	for (const Line &line : r.font.lines) {
+		PixelBounds bounds = setupBounds(r, line);
+		LineEx<T> lex = setupLineEx<T>(line);
+		for (uint32_t py = bounds.py0; py < bounds.py1; py += step) {
+			T y = vectorLoad<T>(rasterYs + py);
+
+			T xs[1];
+			if (!intersectLineEx2(y, lex, xs)) continue;
+
+			addWinding<T>(r, py, xs[0], lex.winding);
+		}
+	}
+
+	for (const Bezier &bezier : r.font.beziers) {
+		PixelBounds bounds = setupBounds(r, bezier);
+		BezierEx<T> bex = setupBezierEx<T>(bezier.a, bezier.b, bezier.c);
+		for (uint32_t py = bounds.py0; py < bounds.py1; py += step) {
+			T y = vectorLoad<T>(rasterYs + py);
+
+			T xs[2], ts[2], windings[2];
+			if (!intersectBezierEx2<T>(y, bex, xs, ts, windings)) continue;
+
+			addWinding<T>(r, py, xs[0], vectorBitmask(windings[0] >= 0.0f));
+			if (anyTrue(xs[1] < Inf)) {
+				addWinding<T>(r, py, xs[1], vectorBitmask(windings[1] >= 0.0f));
+			}
+		}
+	}
+}
+
+template <typename T>
+__declspec(noinline) void computeContourDistance(Rasterizer &r)
+{
+	constexpr uint32_t step = vectorWidth<T>();
+
+	for (const Line &line : r.font.lines) {
+		PixelBounds bounds = setupBounds(r, line);
+
+		Vec2f delta = line.b - line.a;
+		bool vertical = abs(delta.y) >= abs(delta.x);
+
+		if (vertical) {
+			LineEx<T> lex = setupLineEx<T>(line);
+			for (uint32_t py = bounds.py0; py < bounds.py1; py += step) {
+				T y = vectorLoad<T>(r.rasterYs.data + py);
+
+				T xs[1];
+				if (!intersectLineEx2(y, lex, xs)) continue;
+
+				linePassX<T>(r, lex, py, y, xs[0], lex.winding);
+			}
+		} else {
+			Line lineYX = { line.a.yx(), line.b.yx() };
+			LineEx<T> lex = setupLineEx<T>(lineYX);
+			for (uint32_t px = bounds.px0; px < bounds.px1; px += step) {
+				T x = vectorLoad<T>(r.rasterXs.data + px);
+
+				T ys[1];
+				if (!intersectLineEx2(x, lex, ys)) continue;
+
+				linePassY<T>(r, lex, px, x, ys[0], lex.winding);
+			}
+		}
+	}
+
+	for (const Bezier &bezier : r.font.beziers) {
+		PixelBounds bounds = setupBounds(r, bezier);
+
+		BezierNR<T> bnr = setupBezierNR<T>(bezier.a.cast<T>(), bezier.b.cast<T>(), bezier.c.cast<T>());
+		BezierEx<T> bex = setupBezierEx<T>(bezier.a, bezier.b, bezier.c);
+
+		for (uint32_t py = bounds.py0; py < bounds.py1; py += step) {
+			T y = vectorLoad<T>(r.rasterYs.data + py);
+
+			T xs[2], ts[2], windings[2];
+			if (!intersectBezierEx2<T>(y, bex, xs, ts, windings)) continue;
+
+			bezierPassX<T>(r, bnr, py, y, xs[0], ts[0], windings[0]);
+			if (anyTrue(xs[1] < Inf)) {
+				bezierPassX<T>(r, bnr, py, y, xs[1], ts[1], windings[1]);
+			}
+		}
+
+		bex.inPlaceSwapXY();
+
+		for (uint32_t px = bounds.px0; px < bounds.px1; px += step) {
+			T x = vectorLoad<T>(r.rasterXs.data + px);
+
+			T ys[2], ts[2], windings[2];
+			if (!intersectBezierEx2<T>(x, bex, ys, ts, windings)) continue;
+
+			bezierPassY<T>(r, bnr, px, x, ys[0], ts[0], windings[0]);
+			if (anyTrue(ys[1] < Inf)) {
+				bezierPassY<T>(r, bnr, px, x, ys[1], ts[1], windings[1]);
+			}
+		}
+	}
+}
+
+template <typename T>
+__declspec(noinline) void clearInf(float *dst, size_t size)
+{
+	constexpr uint32_t step = vectorWidth<T>();
+	constexpr uint32_t align = step * 4;
+	assert(size % align == 0);
+
+	float *end = dst + size;
+	T inf = T(Inf);
+	for (; dst != end; dst += align) {
+		vectorStore(dst + step*0, inf);
+		vectorStore(dst + step*1, inf);
+		vectorStore(dst + step*2, inf);
+		vectorStore(dst + step*3, inf);
 	}
 }
 
@@ -1781,29 +2013,42 @@ template <typename T>
 void renderSdfNew(Rasterizer &r)
 {
 	constexpr uint32_t step = vectorWidth<T>();
+	uint32_t safeStep = max(step, 4u);
 
-	r.safeHeight = r.height + step * 2;
-	r.safeWidth = r.width + step * 2;
+	r.safeHeight = r.height + safeStep * 2;
+	r.safeWidth = r.width + safeStep * 2;
 	uint32_t safeSize = r.safeWidth * r.safeHeight;
 
-	r.distSqData[0].resize(safeSize, Inf);
-	r.offsetXData[0].resize(safeSize, Inf);
-	r.offsetYData[0].resize(safeSize, Inf);
+	uint32_t safeAlign = 4 * safeStep;
+	safeSize = safeSize + (safeAlign - safeSize % safeAlign) % safeAlign;
 
-	r.distSqData[1].resize(safeSize, Inf);
-	r.offsetXData[1].resize(safeSize, Inf);
-	r.offsetYData[1].resize(safeSize, Inf);
+	CombinedAllocation<16> alloc;
 
-	r.distSq = r.distSqData[0].data() + (r.safeWidth + 1) * step;
-	r.offsetX = r.offsetXData[0].data() + (r.safeWidth + 1) * step;
-	r.offsetY = r.offsetYData[0].data() + (r.safeWidth + 1) * step;
-	r.distSqDst = r.distSqData[1].data() + (r.safeWidth + 1) * step;
-	r.offsetXDst = r.offsetXData[1].data() + (r.safeWidth + 1) * step;
-	r.offsetYDst = r.offsetYData[1].data() + (r.safeWidth + 1) * step;
+	alloc.add(r.distSqData[0], safeSize);
+	alloc.add(r.offsetXData[0], safeSize);
+	alloc.add(r.offsetYData[0], safeSize);
 
-	r.winding.resize(safeSize);
-	r.rasterXs.resize(r.safeWidth);
-	r.rasterYs.resize(r.safeHeight);
+	alloc.add(r.distSqData[1], safeSize);
+	alloc.add(r.offsetXData[1], safeSize);
+	alloc.add(r.offsetYData[1], safeSize);
+
+	alloc.add(r.winding, safeSize);
+	alloc.add(r.rasterXs, r.safeWidth);
+	alloc.add(r.rasterYs, r.safeHeight);
+
+	alloc.setPointerOrAllocate(r.options.scratchMemory, r.options.scratchMemorySize);
+
+	clearInf<T>(r.distSqData[0].data, safeSize);
+	// clearInf<T>(r.offsetXData[0].data, safeSize);
+	// clearInf<T>(r.offsetYData[0].data, safeSize);
+	memset(r.winding.data, 0, r.winding.size * sizeof(int32_t));
+
+	r.distSq = r.distSqData[0].data + (r.safeWidth + 1) * step;
+	r.offsetX = r.offsetXData[0].data + (r.safeWidth + 1) * step;
+	r.offsetY = r.offsetYData[0].data + (r.safeWidth + 1) * step;
+	r.distSqDst = r.distSqData[1].data + (r.safeWidth + 1) * step;
+	r.offsetXDst = r.offsetXData[1].data + (r.safeWidth + 1) * step;
+	r.offsetYDst = r.offsetYData[1].data + (r.safeWidth + 1) * step;
 	r.padding = 2;
 
 	float maximumX = (float)(r.width - 1);
@@ -1812,8 +2057,8 @@ void renderSdfNew(Rasterizer &r)
 	uint32_t width = r.width;
 	uint32_t height = r.height;
 
-	float *rasterXs = r.rasterXs.data();
-	float *rasterYs = r.rasterYs.data();
+	float *rasterXs = r.rasterXs.data;
+	float *rasterYs = r.rasterYs.data;
 
 	// Precompute X values
 	for (uint32_t px = 0; px < width; px += step) {
@@ -1831,74 +2076,9 @@ void renderSdfNew(Rasterizer &r)
 		vectorStore(rasterYs + py, y);
 	}
 
-	// -- Lines
-	int lineIndex = 0;
-	for (const Line &line : r.font.lines) {
-		verbosef("== line %d\n", lineIndex++);
-		PixelBounds bounds = setupBounds(r, line);
-		bool vertical = false;
-
-		{
-			LineEx<T> lex = setupLineEx<T>(line);
-			vertical = lex.vertical;
-			for (uint32_t py = bounds.py0; py < bounds.py1; py += step) {
-				T y = vectorLoad<T>(rasterYs + py);
-
-				T xs[1];
-				if (!intersectLineEx2(y, lex, xs)) continue;
-
-				linePassX<T>(r, lex, py, y, xs[0]);
-			}
-		}
-
-		if (!vertical) {
-			Line lineYX = { line.a.yx(), line.b.yx() };
-			LineEx<T> lex = setupLineEx<T>(lineYX);
-			for (uint32_t px = bounds.px0; px < bounds.px1; px += step) {
-				T x = vectorLoad<T>(rasterXs + px);
-
-				T ys[1];
-				if (!intersectLineEx2(x, lex, ys)) continue;
-
-				linePassY<T>(r, lex, px, x, ys[0]);
-			}
-		}
-	}
-
-	// -- Beziers
-	int bezierIndex = 0;
-	for (const Bezier &bezier : r.font.beziers) {
-		verbosef("== bezier %d\n", bezierIndex++);
-		PixelBounds bounds = setupBounds(r, bezier);
-
-		BezierNR<T> bnr = setupBezierNR<T>(bezier.a.cast<T>(), bezier.b.cast<T>(), bezier.c.cast<T>());
-
-		BezierEx<T> bex = setupBezierEx<T>(bezier.a, bezier.b, bezier.c);
-		for (uint32_t py = bounds.py0; py < bounds.py1; py += step) {
-			T y = vectorLoad<T>(rasterYs + py);
-
-			T xs[2], ts[2], windings[2];
-			if (!intersectBezierEx2<T>(y, bex, xs, ts, windings)) continue;
-
-			bezierPassX<T>(r, bnr, py, y, xs[0], ts[0], windings[0]);
-			if (anyTrue(xs[1] < Inf)) {
-				bezierPassX<T>(r, bnr, py, y, xs[1], ts[1], windings[1]);
-			}
-		}
-
-		bex.inPlaceSwapXY();
-		for (uint32_t px = bounds.px0; px < bounds.px1; px += step) {
-			T x = vectorLoad<T>(rasterXs + px);
-
-			T ys[2], ts[2], windings[2];
-			if (!intersectBezierEx2<T>(x, bex, ys, ts, windings)) continue;
-
-			bezierPassY<T>(r, bnr, px, x, ys[0], ts[0]);
-			if (anyTrue(ys[1] < Inf)) {
-				bezierPassY<T>(r, bnr, px, x, ys[1], ts[1]);
-			}
-		}
-	}
+	computeContourWinding<T>(r);
+	expandWinding(r);
+	computeContourDistance<T>(r);
 
 	// -- Vertices
 	for (const Line &line : r.font.lines) {
@@ -1910,8 +2090,7 @@ void renderSdfNew(Rasterizer &r)
 		vertexPass(r, bezier.c);
 	}
 
-	expandWinding(r);
-
+	// scanFillConservative(r);
 	// scanFill(r);
 
 	finalizeDistance<T>(r);

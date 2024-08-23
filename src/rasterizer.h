@@ -60,6 +60,9 @@ struct RasterizeOptions
 {
 	Vec2f offset;
 	Vec2f scale;
+
+	void *scratchMemory;
+	size_t scratchMemorySize;
 };
 
 void rasterizeFont(const Font &font, const RasterizeOptions &options, uint32_t width, uint32_t height, float *distances);

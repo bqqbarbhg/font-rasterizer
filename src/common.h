@@ -7,8 +7,23 @@
 #include <cmath>
 #include <stdint.h>
 #include <string.h>
+#include <assert.h>
 
 // -- Scalar
+
+template <typename T>
+struct VectorTraits { };
+
+template <>
+struct VectorTraits<float> {
+	static constexpr uint32_t width = 1;
+
+	typedef float FloatType;
+	typedef int32_t IntType;
+};
+
+template <typename T>
+using VectorInt = typename VectorTraits<T>::IntType;
 
 inline bool anyTrue(bool mask) { return mask; }
 inline bool anyFalse(bool mask) { return !mask; }
@@ -22,12 +37,12 @@ inline T min(T a, T b) { return a < b ? a : b; }
 template <typename T>
 inline T max(T a, T b) { return a < b ? b : a; }
 
-
-template <typename T>
-constexpr uint32_t vectorWidth() { return 1; }
-
 template <typename T>
 inline T vectorLoad(const float *memory) { return *memory; }
+
+template <typename T>
+inline VectorInt<T> vectorLoad(const int32_t *memory) { return *memory; }
+
 inline void vectorStore(float *memory, float v) { *memory = v; }
 
 inline int32_t vectorToBits(float v) {
@@ -49,6 +64,19 @@ inline T vectorSequence() { return 0.0f; }
 
 inline uint32_t vectorBitmask(bool v) { return v ? 1 : 0; }
 
+inline void vectorStoreUint(uint32_t *dst, float t) {
+	dst[0] = (uint32_t)(int32_t)t;
+}
+
+template <typename T>
+constexpr uint32_t vectorWidth() { return VectorTraits<T>::width; }
+
+template <typename T>
+inline T flipSignIfNonZero(T value, const int32_t *ints) {
+	auto i = vectorLoad<T>(ints);
+	return maskSelect(i == 0, value, -value);
+}
+
 // -- SSE 2
 
 struct SseFloat4
@@ -62,6 +90,7 @@ struct SseFloat4
 		Mask operator!() const { return _mm_cmpeq_ps(v, _mm_setzero_ps()); }
 		Mask operator&(const Mask &rhs) const { return _mm_and_ps(v, rhs.v); }
 		Mask operator|(const Mask &rhs) const { return _mm_or_ps(v, rhs.v); }
+		Mask operator^(const Mask &rhs) const { return _mm_xor_ps(v, rhs.v); }
 	};
 
 	__m128 v;
@@ -93,6 +122,15 @@ struct SseFloat4
 
 struct SseInt4
 {
+	struct Mask
+	{
+		__m128i v;
+
+		Mask(__m128i v) : v(v) { }
+
+		operator SseFloat4::Mask() { return _mm_castsi128_ps(v); }
+	};
+
 	__m128i v;
 
 	SseInt4() { }
@@ -108,11 +146,21 @@ struct SseInt4
 	SseInt4 operator^(SseInt4 rhs) const { return _mm_xor_si128(v, rhs.v); }
 
 	SseInt4 operator>>(int32_t shift) const { return _mm_srai_epi32(v, shift); }
+
+	Mask operator==(SseInt4 rhs) const { return _mm_cmpeq_epi32(v, rhs.v); }
+};
+
+template <>
+struct VectorTraits<SseFloat4> {
+	static constexpr uint32_t width = 4;
+	typedef SseFloat4 FloatType;
+	typedef SseInt4 IntType;
 };
 
 inline SseFloat4 sqrt(SseFloat4 v) { return _mm_sqrt_ps(v.v); }
 inline SseFloat4 abs(SseFloat4 v) { return _mm_andnot_ps(_mm_set1_ps(-0.0f), v.v); }
 inline SseFloat4 floor(SseFloat4 v) { return _mm_floor_ps(v.v); }
+inline SseFloat4 rint(SseFloat4 v) { return _mm_round_ps(v.v, _MM_FROUND_RINT); }
 inline SseFloat4 min(SseFloat4 a, SseFloat4 b) { return _mm_min_ps(a.v, b.v); }
 inline SseFloat4 max(SseFloat4 a, SseFloat4 b) { return _mm_max_ps(a.v, b.v); }
 inline SseFloat4 copysign(SseFloat4 v, SseFloat4 sign) {
@@ -139,16 +187,16 @@ inline bool anyFalse(SseFloat4::Mask mask) {
 	return !_mm_test_all_ones(t);
 }
 inline SseFloat4 maskSelect(SseFloat4::Mask mask, SseFloat4 a, SseFloat4 b) {
-	// return _mm_or_ps(_mm_and_ps(mask.v, a.v), _mm_andnot_ps(mask.v, b.v));
 	return _mm_blendv_ps(b.v, a.v, mask.v);
 }
-
-template <>
-constexpr uint32_t vectorWidth<SseFloat4>() { return 4; }
 
 template<>
 inline SseFloat4 vectorLoad<SseFloat4>(const float *memory) {
 	return _mm_loadu_ps(memory);
+}
+template<>
+inline SseInt4 vectorLoad<SseFloat4>(const int32_t *memory) {
+	return _mm_loadu_si128((const __m128i*)memory);
 }
 inline void vectorStore(float *memory, SseFloat4 v) {
 	_mm_storeu_ps(memory, v.v);
@@ -169,6 +217,10 @@ inline SseFloat4 vectorSequence<SseFloat4>() {
 
 inline uint32_t vectorBitmask(SseFloat4::Mask v) {
 	return (uint32_t)_mm_movemask_ps(v.v);
+}
+
+inline void vectorStoreUint(uint32_t *dst, SseFloat4 v) {
+	_mm_storeu_si128((__m128i*)dst, _mm_cvtps_epi32(v.v));
 }
 
 // -- Math

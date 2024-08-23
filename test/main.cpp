@@ -16,17 +16,29 @@
 
 unsigned char buffer[24<<20];
 
+unsigned char scratchMemory[24<<20];
+
+#if 0
+#error PLAN: \
+	To avoid internal distances we must do the winding pass first to identify filled areas. \
+	With that we can ignore any shapes which reduce the winding when the pixel in questions is still wound that way. \
+	ie. pixel in winding number 1 ignores line giving it -1 winding in that direction. \
+	Similarly, if the magnitude of the winding number is >=2 then we must ignore any distances. \
+	This still seems a bit sketchy but hopefully the filling algorithm can cover for that, and even then the worst that \
+	can happen is some bad antialiasing.
+#endif
+
 void test()
 {
-	// fread(buffer, 1, sizeof(buffer), fopen("c:/windows/fonts/arialbd.ttf", "rb"));
+	fread(buffer, 1, sizeof(buffer), fopen("c:/windows/fonts/arialbd.ttf", "rb"));
 	// fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Darumadrop_One\\DarumadropOne-Regular.ttf", "rb"));
-	fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Noto_Sans\\NotoSansJP-Medium.ttf", "rb"));
+	// fread(buffer, 1, sizeof(buffer), fopen("C:\\Unity\\Kabe\\Assets\\UI\\Fonts\\Noto_Sans\\NotoSansJP-Medium.ttf", "rb"));
 
 	stbtt_fontinfo font_info;
 	stbtt_InitFont(&font_info, buffer, 0);
 
-	int codepoint = 0x6f22;
-	// int codepoint = 'P';
+	// int codepoint = 0x6f22;
+	int codepoint = 'P';
 
 	stbtt_vertex *vertices;
 	int num_vertices = stbtt_GetCodepointShape(&font_info, codepoint,  &vertices);
@@ -87,6 +99,9 @@ void test()
 	if (height == 0) height = width;
 	RasterizeOptions opts = { };
 
+	opts.scratchMemory = scratchMemory;
+	opts.scratchMemorySize = sizeof(scratchMemory);
+
 	Vec2f boundsExtent = boundsMax - boundsMin;
 	float boundsSize = max(boundsExtent.x, boundsExtent.y) * 1.2f;
 	Vec2f boundsMid = (boundsMin + boundsMax) * 0.5f;
@@ -100,7 +115,7 @@ void test()
 
 	uint64_t minTime = UINT64_MAX;
 
-	uint32_t runs = 10000;
+	uint32_t runs = 100000;
 
 	for (uint32_t i = 0; i < runs; i++) {
 		distances.clear();
@@ -116,11 +131,11 @@ void test()
 	}
 
 	cputime_end_init();
-	printf("Took %.2fms (%ux%u)\n", cputime_cpu_delta_to_sec(NULL, minTime) * 1e3, width, height);
+	printf("Took %.3fms (%ux%u)\n", cputime_cpu_delta_to_sec(NULL, minTime) * 1e3, width, height);
 
 #if 1
 	for (float &d : distances) {
-		d = d / 200.0f + 0.5f;
+		d = d / 100.0f + 0.5f;
 	}
 #endif
 
