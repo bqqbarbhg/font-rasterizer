@@ -94,7 +94,7 @@ void test()
 		prevPos = pos;
 	}
 
-	uint32_t width = 64;
+	uint32_t width = 128;
 	uint32_t height = 0;
 	if (height == 0) height = width;
 	RasterizeOptions opts = { };
@@ -115,7 +115,7 @@ void test()
 
 	uint64_t minTime = UINT64_MAX;
 
-	uint32_t runs = 100000;
+	uint32_t runs = 10000;
 
 	for (uint32_t i = 0; i < runs; i++) {
 		distances.clear();

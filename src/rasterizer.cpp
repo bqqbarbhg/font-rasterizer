@@ -1522,10 +1522,8 @@ __declspec(noinline) void bezierPassY(Rasterizer &r, BezierNR<T> &bnr, uint32_t 
 
 void vertexPass(Rasterizer &r, const Vec2f &point)
 {
-	float pxf = max(rint(inverseTransformX(r, point.x)), 0.0f);
-	float pyf = max(rint(inverseTransformY(r, point.y)), 0.0f);
-	uint32_t px0 = (uint32_t)pxf;
-	uint32_t py0 = (uint32_t)pyf;
+	uint32_t px0 = max(inverseTransformX(r, point.x) + 0.5f, 0.0f);
+	uint32_t py0 = max(inverseTransformY(r, point.y) + 0.5f, 0.0f);
 	int32_t padding = r.padding;
 
 	// TODO: SIMD this!
